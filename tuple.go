@@ -1,4 +1,3 @@
-// Package rebac evaluates relationship-based access-control (ReBAC) tuples.
 package rebac
 
 // RelationTuple is one directed edge in the authorization graph.
