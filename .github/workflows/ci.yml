@@ -2,6 +2,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - 'v*'
   pull_request:
 
 permissions:
@@ -21,3 +25,17 @@ jobs:
       - run: go test ./...
       - run: go test -race ./...
       - run: go test -run=^$ -fuzz=FuzzParseUserset -fuzztime=5s ./...
+
+  release-tag:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate annotated semantic-version tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "$(git cat-file -t "$TAG")" = tag
+          echo "$TAG" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
