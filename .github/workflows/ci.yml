@@ -37,5 +37,6 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          test "$(git cat-file -t "$TAG")" = tag
+          git fetch --force origin "refs/tags/$TAG:refs/tags/validated-$TAG"
+          test "$(git cat-file -t "refs/tags/validated-$TAG")" = tag
           echo "$TAG" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
