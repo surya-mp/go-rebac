@@ -34,7 +34,8 @@ rewrite.
 ```
 
 Now `document:roadmap#viewer@group:engineering#member` grants every group
-member access. Cycles deny that traversal path rather than looping forever.
+member access. Cycles fail the check closed with `ErrCycleDetected` rather than
+looping forever.
 
 ## Rewrite operations
 

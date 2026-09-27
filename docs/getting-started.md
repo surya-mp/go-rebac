@@ -1,4 +1,4 @@
-# Getting started
+# Five-minute getting started
 
 This guide uses the simple, embedded path. It needs only a `StorageEngine` and
 an immutable `AuthorizationModel`.

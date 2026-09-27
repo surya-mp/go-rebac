@@ -77,6 +77,7 @@ application-specific ceilings.
 | Find permitted resources | `LookupResources` |
 | Find permitted subjects | `LookupSubjects` |
 | Inspect relationship edges | `Expand` |
+| Explain a privileged debugging decision | `Explain` |
 
 Revision-aware storage returns an opaque `Revision`. Preserve it when a client
 needs the same authorization graph across multiple reads or pages.

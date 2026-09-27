@@ -9,46 +9,77 @@ import (
 )
 
 var (
-	ErrMaxDepthExceeded = errors.New("rebac: maximum graph depth exceeded")
-	ErrMaxNodesExceeded = errors.New("rebac: maximum graph nodes exceeded")
-	ErrTenantRequired   = errors.New("rebac: tenant ID is required")
-	ErrModelTenant      = errors.New("rebac: selected model belongs to another tenant")
-	ErrInvalidRequest   = errors.New("rebac: invalid request")
-	ErrStorage          = errors.New("rebac: storage error")
+	ErrMaxDepthExceeded   = errors.New("rebac: maximum graph depth exceeded")
+	ErrMaxNodesExceeded   = errors.New("rebac: maximum graph nodes exceeded")
+	ErrMaxTuplesRead      = errors.New("rebac: maximum tuples read exceeded")
+	ErrMaxStorageCalls    = errors.New("rebac: maximum storage calls exceeded")
+	ErrMaxEvaluationTime  = errors.New("rebac: maximum evaluation time exceeded")
+	ErrMaxExpansionOutput = errors.New("rebac: maximum expansion output exceeded")
+	ErrCycleDetected      = errors.New("rebac: authorization graph cycle detected")
+	ErrTenantRequired     = errors.New("rebac: tenant ID is required")
+	ErrModelTenant        = errors.New("rebac: selected model belongs to another tenant")
+	ErrInvalidRequest     = errors.New("rebac: invalid request")
+	ErrStorage            = errors.New("rebac: storage error")
+	ErrCrossTenantTuple   = errors.New("rebac: storage returned a cross-tenant tuple")
 )
 
 const (
-	defaultMaxDepth = 50
-	defaultMaxNodes = 10_000
-	asOfContextKey  = "_rebac_as_of_unix_nano"
+	defaultMaxDepth           = 50
+	defaultMaxNodes           = 10_000
+	defaultMaxTuplesRead      = 100_000
+	defaultMaxStorageCalls    = 1_000
+	defaultMaxEvaluationTime  = 5 * time.Second
+	defaultMaxExpansionOutput = 100_000
+	asOfContextKey            = "_rebac_as_of_unix_nano"
 )
 
 // Engine evaluates tuples supplied by its storage backend.
 type Engine struct {
-	store       StorageEngine
-	model       AuthorizationModel
-	maxDepth    int
-	maxNodes    int
-	observer    Observer
-	stats       *engineStats
-	cache       DecisionCache
-	modelTenant string
-	modelID     string
-	modelSource ModelSnapshotStorage
-	caveats     map[string]CaveatDefinition
-	coalescer   *checkCoalescer
+	store              StorageEngine
+	model              AuthorizationModel
+	maxDepth           int
+	maxNodes           int
+	maxTuplesRead      int
+	maxStorageCalls    int
+	maxEvaluationTime  time.Duration
+	maxExpansionOutput int
+	observer           Observer
+	debugObserver      DebugObserver
+	stats              *engineStats
+	cache              DecisionCache
+	modelTenant        string
+	modelID            string
+	modelVersion       Revision
+	modelHash          string
+	compiledModel      *CompiledModel
+	compiledModels     *compiledModelCache
+	modelSource        ModelSnapshotStorage
+	caveats            map[string]CaveatDefinition
+	coalescer          *checkCoalescer
 }
 
 // NewEngine compiles the application-owned authorization model and uses store
 // only for durable tuple access.
 func NewEngine(store StorageEngine, model AuthorizationModel) (*Engine, error) {
+	compiled, err := CompileModel(model)
+	if err != nil {
+		return nil, err
+	}
+	return NewEngineWithCompiledModel(store, compiled)
+}
+
+// NewEngineWithCompiledModel constructs an Engine from an immutable compiled
+// model. Reuse a CompiledModel when an application creates multiple Engines.
+func NewEngineWithCompiledModel(store StorageEngine, compiled *CompiledModel) (*Engine, error) {
 	if store == nil {
 		return nil, errors.New("rebac: storage engine is nil")
 	}
-	if err := model.validate(); err != nil {
-		return nil, err
+	if compiled == nil {
+		return nil, errors.New("rebac: compiled model is nil")
 	}
-	return newEngine(store, model, defaultMaxDepth, defaultMaxNodes), nil
+	engine := newEngine(store, compiled.model, defaultMaxDepth, defaultMaxNodes, defaultMaxTuplesRead, defaultMaxStorageCalls, defaultMaxEvaluationTime, defaultMaxExpansionOutput)
+	engine.compiledModel = compiled
+	return engine, nil
 }
 
 // NewProductionEngine constructs an Engine only for storage adapters that
@@ -63,12 +94,37 @@ func NewProductionEngine(store ProductionStorage, model AuthorizationModel) (*En
 // WithLimits returns a copy with explicit evaluation ceilings. Both values
 // must be positive; defaults are retained otherwise.
 func (e *Engine) WithLimits(maxDepth, maxNodes int) *Engine {
+	return e.WithEvaluationLimits(EvaluationLimits{MaxDepth: maxDepth, MaxNodes: maxNodes})
+}
+
+// EvaluationLimits bound work performed by one authorization decision. Zero
+// values retain the engine's existing limits.
+type EvaluationLimits struct {
+	MaxDepth, MaxNodes, MaxTuplesRead, MaxStorageCalls int
+	MaxEvaluationTime                                  time.Duration
+	MaxExpansionOutput                                 int
+}
+
+// WithEvaluationLimits returns a copy with explicit authorization work limits.
+func (e *Engine) WithEvaluationLimits(limits EvaluationLimits) *Engine {
 	configured := *e
-	if maxDepth > 0 {
-		configured.maxDepth = maxDepth
+	if limits.MaxDepth > 0 {
+		configured.maxDepth = limits.MaxDepth
 	}
-	if maxNodes > 0 {
-		configured.maxNodes = maxNodes
+	if limits.MaxNodes > 0 {
+		configured.maxNodes = limits.MaxNodes
+	}
+	if limits.MaxTuplesRead > 0 {
+		configured.maxTuplesRead = limits.MaxTuplesRead
+	}
+	if limits.MaxStorageCalls > 0 {
+		configured.maxStorageCalls = limits.MaxStorageCalls
+	}
+	if limits.MaxEvaluationTime > 0 {
+		configured.maxEvaluationTime = limits.MaxEvaluationTime
+	}
+	if limits.MaxExpansionOutput > 0 {
+		configured.maxExpansionOutput = limits.MaxExpansionOutput
 	}
 	return &configured
 }
@@ -77,6 +133,14 @@ func (e *Engine) WithLimits(maxDepth, maxNodes int) *Engine {
 func (e *Engine) WithObserver(observer Observer) *Engine {
 	configured := *e
 	configured.observer = observer
+	return &configured
+}
+
+// WithDebugObserver returns a copy that receives privileged Explain traces.
+// Keep it disabled in ordinary production request paths.
+func (e *Engine) WithDebugObserver(observer DebugObserver) *Engine {
+	configured := *e
+	configured.debugObserver = observer
 	return &configured
 }
 
@@ -96,8 +160,9 @@ func (e *Engine) Stats() Stats {
 	return e.stats.snapshot()
 }
 
-func newEngine(store StorageEngine, model AuthorizationModel, maxDepth, maxNodes int) *Engine {
-	return &Engine{store: store, model: model, maxDepth: maxDepth, maxNodes: maxNodes, stats: &engineStats{}}
+func newEngine(store StorageEngine, model AuthorizationModel, maxDepth, maxNodes, maxTuplesRead, maxStorageCalls int, maxEvaluationTime time.Duration, maxExpansionOutput int) *Engine {
+	modelHash, _ := (ModelDocument{ID: "compiled", Model: model}).ComputeChecksum()
+	return &Engine{store: store, model: model, maxDepth: maxDepth, maxNodes: maxNodes, maxTuplesRead: maxTuplesRead, maxStorageCalls: maxStorageCalls, maxEvaluationTime: maxEvaluationTime, maxExpansionOutput: maxExpansionOutput, modelHash: modelHash, compiledModels: &compiledModelCache{models: make(map[compiledModelKey]*CompiledModel)}, stats: &engineStats{}}
 }
 
 // Check reports whether user has relation on namespace:objectID within tenantID.
@@ -147,6 +212,9 @@ func (e *Engine) CheckWithRevisionAt(ctx context.Context, revision Revision, cav
 }
 
 func withAsOf(caveatContext CaveatContext, asOfUnixNano int64) CaveatContext {
+	if asOfUnixNano == 0 {
+		return caveatContext
+	}
 	contextAt := make(CaveatContext, len(caveatContext)+1)
 	for key, value := range caveatContext {
 		contextAt[key] = value
@@ -171,7 +239,9 @@ func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revis
 		return allowed, token.TupleRevision, err
 	}
 	started := time.Now()
-	nodes := 0
+	evaluation := evaluationStats{}
+	var measured *memoReader
+	cacheHit := false
 	defer func() {
 		if e == nil || e.stats == nil {
 			return
@@ -186,11 +256,24 @@ func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revis
 			e.stats.errors.Add(1)
 		}
 		if e.observer != nil {
-			e.observer.ObserveCheck(ctx, CheckEvent{TenantID: tenantID, User: user, Relation: relation, Namespace: namespace, ObjectID: objectID, Revision: used, Allowed: allowed, Reason: reason, Err: err, Duration: time.Since(started), Nodes: nodes})
+			event := CheckEvent{TenantID: tenantID, User: user, Relation: relation, Namespace: namespace, ObjectID: objectID, Revision: used, ModelID: e.modelID, ModelVersion: e.modelVersion, Allowed: allowed, Reason: reason, Err: err, Duration: time.Since(started), Nodes: evaluation.nodes, MaxDepth: evaluation.maxDepth, Branches: evaluation.branches, Cycles: evaluation.cycles, CacheHit: cacheHit}
+			if measured != nil {
+				event.StorageCalls, event.TuplesRead, event.CacheHits = measured.calls, measured.tuples, measured.hits
+			}
+			e.observer.ObserveCheck(ctx, event)
 		}
 	}()
 	if e == nil || e.store == nil {
 		return false, "", errors.New("rebac: storage engine is nil")
+	}
+	if e.maxEvaluationTime > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, e.maxEvaluationTime, ErrMaxEvaluationTime)
+		defer cancel()
+		defer func() { err = evaluationError(ctx, err) }()
+	}
+	if err := validateCaveatContext(caveatContext); err != nil {
+		return false, "", fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	if err := e.validateTenant(tenantID); err != nil {
 		return false, "", err
@@ -198,9 +281,12 @@ func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revis
 	if err := e.model.validateCheck(user, relation, namespace, objectID); err != nil {
 		return false, "", err
 	}
-	if key, ok := decisionCacheKey(revision, tenantID, user, relation, namespace, objectID, caveatContext); ok && e.cache != nil {
-		if cached, found, cacheErr := e.cache.Get(ctx, key); cacheErr == nil && found {
-			return cached, revision, nil
+	if explainTraceFromContext(ctx) == nil {
+		if key, ok := decisionCacheKey(e.modelID, e.modelVersion, e.modelHash, revision, tenantID, user, relation, namespace, objectID, caveatContext); ok && e.cache != nil {
+			if cached, found, cacheErr := e.cache.Get(ctx, key); cacheErr == nil && found {
+				cacheHit = true
+				return cached, revision, nil
+			}
 		}
 	}
 
@@ -222,13 +308,14 @@ func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revis
 			reader, release = e.store, func() error { return nil }
 		}
 	}
-	reader = &memoReader{reader: reader, cache: make(map[tupleFilterKey][]RelationTuple)}
-	allowed, err = e.check(ctx, reader, caveatContext, tenantID, user, relation, namespace, objectID, make(map[checkKey]struct{}), 0, &nodes)
+	measured = &memoReader{reader: reader, cache: make(map[tupleFilterKey][]RelationTuple), maxTuples: e.maxTuplesRead, maxCalls: e.maxStorageCalls}
+	reader = measured
+	allowed, err = e.check(ctx, reader, caveatContext, tenantID, user, relation, namespace, objectID, make(map[checkKey]struct{}), 0, &evaluation)
 	if releaseErr := release(); err == nil && releaseErr != nil {
 		return false, "", releaseErr
 	}
-	if err == nil && e.cache != nil {
-		if key, ok := decisionCacheKey(used, tenantID, user, relation, namespace, objectID, caveatContext); ok {
+	if err == nil && explainTraceFromContext(ctx) == nil && e.cache != nil {
+		if key, ok := decisionCacheKey(e.modelID, e.modelVersion, e.modelHash, used, tenantID, user, relation, namespace, objectID, caveatContext); ok {
 			_ = e.cache.Set(ctx, key, allowed)
 		}
 	}
@@ -242,8 +329,14 @@ func decisionReason(allowed bool, err error) DecisionReason {
 		}
 		return DecisionDenied
 	}
-	if errors.Is(err, ErrMaxDepthExceeded) || errors.Is(err, ErrMaxNodesExceeded) {
+	if errors.Is(err, ErrMaxDepthExceeded) || errors.Is(err, ErrMaxNodesExceeded) || errors.Is(err, ErrMaxEvaluationTime) {
 		return DecisionLimitExceeded
+	}
+	if errors.Is(err, ErrMaxTuplesRead) || errors.Is(err, ErrMaxStorageCalls) {
+		return DecisionLimitExceeded
+	}
+	if errors.Is(err, ErrCycleDetected) {
+		return DecisionCycleDetected
 	}
 	if errors.Is(err, ErrStorage) {
 		return DecisionStorageError
@@ -266,7 +359,7 @@ func (e *Engine) WriteTupleWithRevision(ctx context.Context, tuple RelationTuple
 	if err := e.validateTenant(tuple.TenantID); err != nil {
 		return "", err
 	}
-	if err := e.model.validateTuple(tuple); err != nil {
+	if err := e.model.ValidateTuple(tuple); err != nil {
 		return "", err
 	}
 	if revisions, ok := e.store.(RevisionedStorage); ok {
@@ -297,7 +390,7 @@ func (e *Engine) DeleteTupleWithRevision(ctx context.Context, tuple RelationTupl
 	if err := e.validateTenant(tuple.TenantID); err != nil {
 		return "", err
 	}
-	if err := e.model.validateTuple(tuple); err != nil {
+	if err := e.model.ValidateTuple(tuple); err != nil {
 		return "", err
 	}
 	if revisions, ok := e.store.(RevisionedStorage); ok {
@@ -372,7 +465,7 @@ func (e *Engine) validateMutationTuple(tuple RelationTuple) error {
 	if err := e.validateTenant(tuple.TenantID); err != nil {
 		return err
 	}
-	return e.model.validateTuple(tuple)
+	return e.model.ValidateTuple(tuple)
 }
 
 func (e *Engine) validateTenant(tenantID string) error {
@@ -416,61 +509,105 @@ type checkKey struct {
 	tenantID, user, relation, namespace, objectID string
 }
 
+type evaluationStats struct {
+	nodes, maxDepth, branches, cycles int
+}
+
+func evaluationError(ctx context.Context, err error) error {
+	if err != nil && errors.Is(context.Cause(ctx), ErrMaxEvaluationTime) {
+		return ErrMaxEvaluationTime
+	}
+	return err
+}
+
 type tupleFilterKey struct {
 	tenantID, namespace, objectID, relation, user string
 }
 
 type memoReader struct {
-	reader TupleReader
-	cache  map[tupleFilterKey][]RelationTuple
+	reader              TupleReader
+	cache               map[tupleFilterKey][]RelationTuple
+	tuples, calls, hits int
+	maxTuples, maxCalls int
 }
 
 func (r *memoReader) QueryTuples(ctx context.Context, filter RelationTuple) ([]RelationTuple, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	key := tupleFilterKey{filter.TenantID, filter.Namespace, filter.ObjectID, filter.Relation, filter.User}
 	if tuples, ok := r.cache[key]; ok {
+		r.hits++
 		return tuples, nil
 	}
-	tuples, err := r.reader.QueryTuples(ctx, filter)
-	if err == nil {
-		r.cache[key] = tuples
+	if r.maxCalls > 0 && r.calls >= r.maxCalls {
+		return nil, ErrMaxStorageCalls
 	}
+	r.calls++
+	tuples, err := r.reader.QueryTuples(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	if r.maxTuples > 0 && len(tuples) > r.maxTuples-r.tuples {
+		return nil, ErrMaxTuplesRead
+	}
+	r.tuples += len(tuples)
+	r.cache[key] = tuples
 	return tuples, err
 }
 
-func (e *Engine) check(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int, nodes *int) (bool, error) {
+func (e *Engine) check(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int, evaluation *evaluationStats) (allowed bool, err error) {
+	trace := explainTraceFromContext(ctx)
+	if trace != nil {
+		definition := e.model.Namespaces[namespace].Relations[relation]
+		node := trace.addNode(user, relation, namespace, objectID, definition.Rewrite)
+		ctx = context.WithValue(ctx, explainNodeContextKey{}, node)
+		defer func() { trace.finishNode(node, allowed, err) }()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if depth > e.maxDepth {
 		return false, ErrMaxDepthExceeded
 	}
-	if *nodes >= e.maxNodes {
+	if evaluation.nodes >= e.maxNodes {
 		return false, ErrMaxNodesExceeded
 	}
-	(*nodes)++
+	evaluation.nodes++
+	if depth > evaluation.maxDepth {
+		evaluation.maxDepth = depth
+	}
 	key := checkKey{tenantID, user, relation, namespace, objectID}
 	if _, ok := visiting[key]; ok {
-		return false, nil // This path loops back to an in-progress graph node.
+		evaluation.cycles++
+		return false, ErrCycleDetected
 	}
 	visiting[key] = struct{}{}
 	defer delete(visiting, key)
 
 	definition := e.model.Namespaces[namespace].Relations[relation]
-	return e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, definition.Rewrite, visiting, depth, nodes)
+	return e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, definition.Rewrite, visiting, depth, evaluation)
 }
 
-func (e *Engine) evaluateRewrite(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string, rewrite Rewrite, visiting map[checkKey]struct{}, depth int, nodes *int) (bool, error) {
+func (e *Engine) evaluateRewrite(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string, rewrite Rewrite, visiting map[checkKey]struct{}, depth int, evaluation *evaluationStats) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	kind, err := rewrite.kind()
 	if err != nil {
 		return false, err
 	}
 	switch kind {
 	case "this":
-		return e.checkThis(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, visiting, depth, nodes)
+		return e.checkThis(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, visiting, depth, evaluation)
 	case "computed":
-		return e.check(ctx, store, caveatContext, tenantID, user, rewrite.ComputedUserset, namespace, objectID, visiting, depth+1, nodes)
+		return e.check(ctx, store, caveatContext, tenantID, user, rewrite.ComputedUserset, namespace, objectID, visiting, depth+1, evaluation)
 	case "tuple-to-userset":
-		return e.checkTupleToUserset(ctx, store, caveatContext, tenantID, user, namespace, objectID, *rewrite.TupleToUserset, visiting, depth, nodes)
+		return e.checkTupleToUserset(ctx, store, caveatContext, tenantID, user, namespace, objectID, *rewrite.TupleToUserset, visiting, depth, evaluation)
 	case "union":
 		for _, child := range rewrite.Union {
-			allowed, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, child, visiting, depth, nodes)
+			evaluation.branches++
+			allowed, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, child, visiting, depth, evaluation)
 			if err != nil || allowed {
 				return allowed, err
 			}
@@ -478,42 +615,62 @@ func (e *Engine) evaluateRewrite(ctx context.Context, store TupleReader, caveatC
 		return false, nil
 	case "intersection":
 		for _, child := range rewrite.Intersection {
-			allowed, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, child, visiting, depth, nodes)
+			evaluation.branches++
+			allowed, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, child, visiting, depth, evaluation)
 			if err != nil || !allowed {
 				return allowed, err
 			}
 		}
 		return true, nil
 	case "exclusion":
-		allowed, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, rewrite.Exclusion.Base, visiting, depth, nodes)
+		evaluation.branches++
+		allowed, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, rewrite.Exclusion.Base, visiting, depth, evaluation)
 		if err != nil || !allowed {
 			return allowed, err
 		}
-		excluded, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, rewrite.Exclusion.Subtract, visiting, depth, nodes)
+		evaluation.branches++
+		excluded, err := e.evaluateRewrite(ctx, store, caveatContext, tenantID, user, relation, namespace, objectID, rewrite.Exclusion.Subtract, visiting, depth, evaluation)
 		return !excluded, err
 	default:
 		return false, errors.New("rebac: invalid rewrite")
 	}
 }
 
-func (e *Engine) checkThis(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int, nodes *int) (bool, error) {
+func (e *Engine) checkThis(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int, evaluation *evaluationStats) (bool, error) {
 	tuples, err := e.queryTuples(ctx, store, tenantID, RelationTuple{Namespace: namespace, ObjectID: objectID, Relation: relation})
 	if err != nil {
 		return false, err
 	}
 	for _, tuple := range tuples {
+		trace, node := explainTraceFromContext(ctx), explainNodeFromContext(ctx)
+		tupleNode := -1
+		if trace != nil {
+			tupleNode = trace.addTuple(node, tuple)
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		applies, err := e.evaluateCaveat(ctx, tuple, caveatContext)
 		if err != nil {
 			return false, err
+		}
+		if trace != nil {
+			trace.finishTuple(node, tupleNode, applies, false)
 		}
 		if !applies {
 			continue
 		}
 		if tuple.User == user {
+			if trace != nil {
+				trace.finishTuple(node, tupleNode, true, true)
+			}
 			return true, nil
 		}
 		if tuple.User == "user:*" {
 			if namespace, _, ok := parseDirectSubject(user); ok && namespace == "user" {
+				if trace != nil {
+					trace.finishTuple(node, tupleNode, true, true)
+				}
 				return true, nil
 			}
 			continue
@@ -522,9 +679,12 @@ func (e *Engine) checkThis(ctx context.Context, store TupleReader, caveatContext
 		if !ok {
 			continue
 		}
-		allowed, err := e.check(ctx, store, caveatContext, tenantID, user, usersetRelation, usersetNamespace, usersetObjectID, visiting, depth+1, nodes)
+		allowed, err := e.check(ctx, store, caveatContext, tenantID, user, usersetRelation, usersetNamespace, usersetObjectID, visiting, depth+1, evaluation)
 		if err != nil {
 			return false, err
+		}
+		if trace != nil {
+			trace.finishTuple(node, tupleNode, true, allowed)
 		}
 		if allowed {
 			return true, nil
@@ -533,15 +693,26 @@ func (e *Engine) checkThis(ctx context.Context, store TupleReader, caveatContext
 	return false, nil
 }
 
-func (e *Engine) checkTupleToUserset(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, namespace, objectID string, rewrite TupleToUserset, visiting map[checkKey]struct{}, depth int, nodes *int) (bool, error) {
+func (e *Engine) checkTupleToUserset(ctx context.Context, store TupleReader, caveatContext CaveatContext, tenantID, user, namespace, objectID string, rewrite TupleToUserset, visiting map[checkKey]struct{}, depth int, evaluation *evaluationStats) (bool, error) {
 	tuples, err := e.queryTuples(ctx, store, tenantID, RelationTuple{Namespace: namespace, ObjectID: objectID, Relation: rewrite.Tupleset})
 	if err != nil {
 		return false, err
 	}
 	for _, tuple := range tuples {
+		trace, node := explainTraceFromContext(ctx), explainNodeFromContext(ctx)
+		tupleNode := -1
+		if trace != nil {
+			tupleNode = trace.addTuple(node, tuple)
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		applies, err := e.evaluateCaveat(ctx, tuple, caveatContext)
 		if err != nil {
 			return false, err
+		}
+		if trace != nil {
+			trace.finishTuple(node, tupleNode, applies, false)
 		}
 		if !applies {
 			continue
@@ -550,9 +721,12 @@ func (e *Engine) checkTupleToUserset(ctx context.Context, store TupleReader, cav
 		if !ok {
 			continue
 		}
-		allowed, err := e.check(ctx, store, caveatContext, tenantID, user, rewrite.ComputedUserset, targetNamespace, targetObjectID, visiting, depth+1, nodes)
+		allowed, err := e.check(ctx, store, caveatContext, tenantID, user, rewrite.ComputedUserset, targetNamespace, targetObjectID, visiting, depth+1, evaluation)
 		if err != nil {
 			return false, err
+		}
+		if trace != nil {
+			trace.finishTuple(node, tupleNode, true, allowed)
 		}
 		if allowed {
 			return true, nil
@@ -600,9 +774,9 @@ func (e *Engine) queryTuples(ctx context.Context, store TupleReader, tenantID st
 func (e *Engine) validateTuples(tenantID string, tuples []RelationTuple) ([]RelationTuple, error) {
 	for _, tuple := range tuples {
 		if tuple.TenantID != tenantID {
-			return nil, errors.New("rebac: storage returned a cross-tenant tuple")
+			return nil, ErrCrossTenantTuple
 		}
-		if err := e.model.validateTuple(tuple); err != nil {
+		if err := e.model.ValidateTuple(tuple); err != nil {
 			return nil, err
 		}
 	}
@@ -620,7 +794,7 @@ func (e *Engine) observeMutation(ctx context.Context, revision Revision, changes
 }
 
 func wrapStorageError(err error) error {
-	if err == nil || errors.Is(err, ErrInvalidRevision) || errors.Is(err, ErrPreconditionFailed) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrInvalidRevision) || errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrMaxTuplesRead) || errors.Is(err, ErrMaxStorageCalls) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrStorage, err)

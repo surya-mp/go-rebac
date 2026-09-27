@@ -42,6 +42,42 @@ func FuzzParseUserset(f *testing.F) {
 	})
 }
 
+func FuzzValidateTuple(f *testing.F) {
+	f.Add("acme", "document", "plan", "viewer", "user:alice", "")
+	f.Add("acme", "document", "plan", "viewer", "group:eng#member", "")
+	f.Fuzz(func(t *testing.T, tenant, namespace, objectID, relation, user, caveat string) {
+		_ = (RelationTuple{TenantID: tenant, Namespace: namespace, ObjectID: objectID, Relation: relation, User: user, Caveat: caveat}).ValidateSyntax()
+	})
+}
+
+func FuzzValidateModel(f *testing.F) {
+	f.Add("document", "viewer", "user")
+	f.Add("group", "member", "group")
+	f.Fuzz(func(t *testing.T, namespace, relation, subjectNamespace string) {
+		_ = (AuthorizationModel{Namespaces: map[string]NamespaceDefinition{
+			namespace: {Relations: map[string]RelationDefinition{
+				relation: {AllowedSubjects: []SubjectReference{{Namespace: subjectNamespace}}},
+			}},
+		}}).Validate()
+	})
+}
+
+func FuzzTenantIsolation(f *testing.F) {
+	f.Add("acme")
+	f.Add("other")
+	store := memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}}
+	engine, err := NewEngine(&store, testModel())
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Fuzz(func(t *testing.T, tenant string) {
+		allowed, err := engine.Check(context.Background(), tenant, "user:alice", "viewer", "document", "plan")
+		if err == nil && allowed != (tenant == "acme") {
+			t.Fatalf("Check(%q) = %v, nil; want %v", tenant, allowed, tenant == "acme")
+		}
+	})
+}
+
 func TestConcurrentChecks(t *testing.T) {
 	store := memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}}
 	engine, err := NewEngine(&store, testModel())

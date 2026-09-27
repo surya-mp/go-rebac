@@ -74,4 +74,18 @@ func TestHandlers(t *testing.T) {
 	if err := json.Unmarshal(check.Body.Bytes(), &response); err != nil || !response.Allowed {
 		t.Fatalf("check response = %#v, %v", response, err)
 	}
+
+	batch := httptest.NewRecorder()
+	server.Handler().ServeHTTP(batch, httptest.NewRequest(http.MethodPost, "/v1/batch-check", strings.NewReader(`{"checks":[{"tenant_id":"acme","namespace":"document","object_id":"plan","relation":"viewer","user":"user:alice"},{"tenant_id":"acme","namespace":"document","object_id":"plan","relation":"viewer","user":"user:bob"}]}`)))
+	var batchResponse BatchCheckResponse
+	if batch.Code != http.StatusOK || json.Unmarshal(batch.Body.Bytes(), &batchResponse) != nil || len(batchResponse.Checks) != 2 || !batchResponse.Checks[0].Allowed || batchResponse.Checks[1].Allowed {
+		t.Fatalf("batch response = %d: %s", batch.Code, batch.Body.String())
+	}
+
+	limited := server.WithRequestLimits(RequestLimits{MaxBatchSize: 1})
+	tooLarge := httptest.NewRecorder()
+	limited.Handler().ServeHTTP(tooLarge, httptest.NewRequest(http.MethodPost, "/v1/batch-check", strings.NewReader(`{"checks":[{},{}]}`)))
+	if tooLarge.Code != http.StatusBadRequest {
+		t.Fatalf("batch limit status = %d: %s", tooLarge.Code, tooLarge.Body.String())
+	}
 }

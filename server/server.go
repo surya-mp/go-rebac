@@ -3,18 +3,37 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/surya-mp/go-rebac"
 )
 
 // Server adapts one configured Engine to data-plane and administration handlers.
 type Server struct {
-	engine *rebac.Engine
-	codec  rebac.TokenCodec
+	engine       *rebac.Engine
+	codec        rebac.TokenCodec
+	maxBodyBytes int64
+	maxBatchSize int
+	timeout      time.Duration
+}
+
+const (
+	defaultMaxBodyBytes = 1 << 20
+	defaultMaxBatchSize = 100
+	defaultTimeout      = 5 * time.Second
+)
+
+// RequestLimits bound work accepted by the optional HTTP adapter. Zero values
+// retain the secure defaults.
+type RequestLimits struct {
+	MaxBodyBytes int64
+	MaxBatchSize int
+	Timeout      time.Duration
 }
 
 // New returns HTTP handlers for an already constructed engine.
@@ -22,7 +41,7 @@ func New(engine *rebac.Engine) (*Server, error) {
 	if engine == nil {
 		return nil, errors.New("rebac/server: engine is nil")
 	}
-	return &Server{engine: engine}, nil
+	return &Server{engine: engine, maxBodyBytes: defaultMaxBodyBytes, maxBatchSize: defaultMaxBatchSize, timeout: defaultTimeout}, nil
 }
 
 // NewWithTokenCodec configures opaque, authenticated consistency tokens for
@@ -31,7 +50,22 @@ func NewWithTokenCodec(engine *rebac.Engine, codec rebac.TokenCodec) (*Server, e
 	if engine == nil || codec == nil {
 		return nil, errors.New("rebac/server: engine and token codec are required")
 	}
-	return &Server{engine: engine, codec: codec}, nil
+	return &Server{engine: engine, codec: codec, maxBodyBytes: defaultMaxBodyBytes, maxBatchSize: defaultMaxBatchSize, timeout: defaultTimeout}, nil
+}
+
+// WithRequestLimits returns a copy with explicit HTTP request ceilings.
+func (s *Server) WithRequestLimits(limits RequestLimits) *Server {
+	configured := *s
+	if limits.MaxBodyBytes > 0 {
+		configured.maxBodyBytes = limits.MaxBodyBytes
+	}
+	if limits.MaxBatchSize > 0 {
+		configured.maxBatchSize = limits.MaxBatchSize
+	}
+	if limits.Timeout > 0 {
+		configured.timeout = limits.Timeout
+	}
+	return &configured
 }
 
 // Handler exposes read-only authorization endpoints. Mount it behind the
@@ -41,13 +75,14 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("POST /v1/check", s.check)
+	mux.HandleFunc("POST /v1/batch-check", s.batchCheck)
 	mux.HandleFunc("POST /v1/check/consistent", s.checkConsistent)
 	mux.HandleFunc("POST /v1/content-change-check", s.contentChangeCheck)
 	mux.HandleFunc("POST /v1/tuples/read", s.readTuples)
 	mux.HandleFunc("POST /v1/lookup/resources", s.lookupResources)
 	mux.HandleFunc("POST /v1/lookup/subjects", s.lookupSubjects)
 	mux.HandleFunc("POST /v1/expand", s.expand)
-	return mux
+	return s.withTimeout(mux)
 }
 
 // AdminHandler exposes tuple mutation endpoints. Mount it separately behind
@@ -59,7 +94,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("POST /v1/tuples/delete", s.deleteTuple)
 	mux.HandleFunc("POST /v1/tuples/mutate", s.mutate)
 	mux.HandleFunc("POST /v1/objects/delete", s.deleteObject)
-	return mux
+	return s.withTimeout(mux)
 }
 
 // CheckRequest is the JSON payload for POST /v1/check.
@@ -78,6 +113,16 @@ type CheckRequest struct {
 type CheckResponse struct {
 	Allowed  bool           `json:"allowed"`
 	Revision rebac.Revision `json:"revision,omitempty"`
+}
+
+// BatchCheckRequest contains independently evaluated authorization checks.
+type BatchCheckRequest struct {
+	Checks []CheckRequest `json:"checks"`
+}
+
+// BatchCheckResponse preserves the input check order.
+type BatchCheckResponse struct {
+	Checks []CheckResponse `json:"checks"`
 }
 
 // ConsistentCheckRequest adds an at-least-as-fresh token to a check.
@@ -143,20 +188,46 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) check(w http.ResponseWriter, r *http.Request) {
 	var request CheckRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
-	allowed, revision, err := s.engine.CheckWithRevisionAt(r.Context(), request.Revision, request.CaveatContext, request.AsOfUnixNano, request.TenantID, request.User, request.Relation, request.Namespace, request.ObjectID)
+	response, err := s.evaluateCheck(r.Context(), request)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, CheckResponse{Allowed: allowed, Revision: revision})
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) batchCheck(w http.ResponseWriter, r *http.Request) {
+	var request BatchCheckRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	if len(request.Checks) == 0 || len(request.Checks) > s.maxBatchSize {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid batch size"})
+		return
+	}
+	response := BatchCheckResponse{Checks: make([]CheckResponse, 0, len(request.Checks))}
+	for _, check := range request.Checks {
+		result, err := s.evaluateCheck(r.Context(), check)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		response.Checks = append(response.Checks, result)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) evaluateCheck(ctx context.Context, request CheckRequest) (CheckResponse, error) {
+	allowed, revision, err := s.engine.CheckWithRevisionAt(ctx, request.Revision, request.CaveatContext, request.AsOfUnixNano, request.TenantID, request.User, request.Relation, request.Namespace, request.ObjectID)
+	return CheckResponse{Allowed: allowed, Revision: revision}, err
 }
 
 func (s *Server) checkConsistent(w http.ResponseWriter, r *http.Request) {
 	var request ConsistentCheckRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	minimum, err := s.decodeToken(request.AtLeastAsFresh, request.OpaqueToken)
@@ -174,7 +245,7 @@ func (s *Server) checkConsistent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) contentChangeCheck(w http.ResponseWriter, r *http.Request) {
 	var request contentChangeCheckRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	minimum, err := s.decodeToken(request.AtLeastAsFresh, request.OpaqueToken)
@@ -216,7 +287,7 @@ func (s *Server) writeConsistentResponse(w http.ResponseWriter, allowed bool, to
 
 func (s *Server) readTuples(w http.ResponseWriter, r *http.Request) {
 	var request rebac.ReadTuplesRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	page, err := s.engine.ReadTuples(r.Context(), request)
@@ -229,7 +300,7 @@ func (s *Server) readTuples(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lookupResources(w http.ResponseWriter, r *http.Request) {
 	var request rebac.LookupResourcesRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	page, err := s.engine.LookupResources(r.Context(), request)
@@ -242,7 +313,7 @@ func (s *Server) lookupResources(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lookupSubjects(w http.ResponseWriter, r *http.Request) {
 	var request rebac.LookupSubjectsRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	page, err := s.engine.LookupSubjects(r.Context(), request)
@@ -255,7 +326,7 @@ func (s *Server) lookupSubjects(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 	var request expandRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	expansion, revision, err := s.engine.Expand(r.Context(), request.Revision, request.TenantID, request.Relation, request.Namespace, request.ObjectID)
@@ -268,7 +339,7 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeTuple(w http.ResponseWriter, r *http.Request) {
 	var request tupleRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	revision, err := s.engine.WriteTupleWithRevision(r.Context(), request.Tuple)
@@ -281,7 +352,7 @@ func (s *Server) writeTuple(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteTuple(w http.ResponseWriter, r *http.Request) {
 	var request tupleRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	revision, err := s.engine.DeleteTupleWithRevision(r.Context(), request.Tuple)
@@ -294,7 +365,7 @@ func (s *Server) deleteTuple(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request) {
 	var request objectRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	revision, err := s.engine.DeleteObject(r.Context(), request.TenantID, request.Namespace, request.ObjectID)
@@ -307,7 +378,7 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) mutate(w http.ResponseWriter, r *http.Request) {
 	var request mutateRequest
-	if !decodeJSON(w, r, &request) {
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
 	revision, err := s.engine.Mutate(r.Context(), request.Changes, request.Preconditions)
@@ -318,8 +389,12 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, revisionResponse{Revision: revision})
 }
 
-func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	limit := s.maxBodyBytes
+	if limit <= 0 {
+		limit = defaultMaxBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -331,6 +406,13 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Server) withTimeout(handler http.Handler) http.Handler {
+	if s.timeout <= 0 {
+		return handler
+	}
+	return http.TimeoutHandler(handler, s.timeout, `{"error":"request timed out"}`)
 }
 
 func writeError(w http.ResponseWriter, err error) {

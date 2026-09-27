@@ -20,6 +20,24 @@ jobs:
           check-latest: true
       - run: test -z "$(gofmt -l $(find . -name '*.go' -type f))"
       - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - run: go test ./...
       - run: go test -race ./...
       - run: go test -run=^$ -fuzz=FuzzParseUserset -fuzztime=5s .
+      - run: go test -run=^$ -fuzz=FuzzValidateTuple -fuzztime=5s .
+      - run: go test -run=^$ -fuzz=FuzzValidateModel -fuzztime=5s .
+      - run: go test -run=^$ -fuzz=FuzzTenantIsolation -fuzztime=5s .
+  compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.23.x', '1.24.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+      - run: go test ./...

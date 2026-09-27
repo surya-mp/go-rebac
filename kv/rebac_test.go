@@ -25,6 +25,31 @@ func TestReBACStoreConsistent(t *testing.T) {
 	})
 }
 
+func TestReBACStoreCapabilities(t *testing.T) {
+	conformance.RunRevisioned(t, func(testing.TB) (rebac.StorageEngine, rebac.RevisionedStorage) {
+		store := kv.NewReBACStore(kv.New())
+		return store, store
+	})
+	conformance.RunMutations(t, func(testing.TB) (rebac.StorageEngine, rebac.MutationStorage) {
+		store := kv.NewReBACStore(kv.New())
+		return store, store
+	})
+	conformance.RunModelStorage(t, func(testing.TB) rebac.ModelStorage {
+		return kv.NewReBACStore(kv.New())
+	})
+	conformance.RunActiveModels(t, func(testing.TB) rebac.ActiveModelStorage {
+		return kv.NewReBACStore(kv.New())
+	})
+	conformance.RunCandidateReaders(t, func(testing.TB) (rebac.StorageEngine, rebac.ResourceCandidateReader, rebac.SubjectCandidateReader) {
+		store := kv.NewReBACStore(kv.New())
+		return store, store, store
+	})
+	conformance.RunWatches(t, func(testing.TB) (rebac.StorageEngine, rebac.WatchStorage) {
+		store := kv.NewReBACStore(kv.New())
+		return store, store
+	})
+}
+
 func TestReBACStoreKeepsRevisionedCandidates(t *testing.T) {
 	store := kv.NewReBACStore(kv.New())
 	ctx := context.Background()
@@ -153,14 +178,93 @@ func TestAuthorizationModelCompareAndSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if stored.Version == "" || stored.ParentVersion != "" || stored.CreatedAtUnixNano == 0 || stored.Checksum == "" {
+		t.Fatalf("stored model metadata = %#v; want initial immutable metadata", stored)
+	}
+	if stored.State != rebac.ModelPublished {
+		t.Fatalf("stored model state = %q; want published", stored.State)
+	}
+	if checksum, err := stored.ComputeChecksum(); err != nil || checksum != stored.Checksum {
+		t.Fatalf("stored checksum = %q, %v; want %q, nil", checksum, err, stored.Checksum)
+	}
 	if _, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, ""); !errors.Is(err, rebac.ErrPreconditionFailed) {
 		t.Fatalf("duplicate create error = %v; want ErrPreconditionFailed", err)
 	}
 	if _, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, "wrong"); !errors.Is(err, rebac.ErrPreconditionFailed) {
 		t.Fatalf("stale update error = %v; want ErrPreconditionFailed", err)
 	}
-	if _, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, stored.Version); err != nil {
+	updated, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, stored.Version)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if updated.Version == stored.Version || updated.ParentVersion != stored.Version || updated.Checksum != stored.Checksum {
+		t.Fatalf("updated model metadata = %#v; want a new version parented by %q", updated, stored.Version)
+	}
+	if historical, err := store.ReadAuthorizationModel(ctx, "acme", model.ID, stored.Version); err != nil || historical.Version != stored.Version || historical.ParentVersion != "" {
+		t.Fatalf("historical model = %#v, %v; want immutable initial version", historical, err)
+	}
+	versions, err := store.ListAuthorizationModelVersions(ctx, "acme", model.ID)
+	if err != nil || len(versions) != 2 || versions[0].Version != stored.Version || versions[1].Version != updated.Version {
+		t.Fatalf("ListAuthorizationModelVersions() = %#v, %v; want ordered immutable history", versions, err)
+	}
+}
+
+func TestAuthorizationModelActivationAndRollback(t *testing.T) {
+	store := kv.NewReBACStore(kv.New())
+	ctx := context.Background()
+	model := rebac.ModelDocument{ID: "access", Model: rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}}}
+	first, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, first.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _, err := store.ActivateAuthorizationModel(ctx, "acme", model.ID, "", first.Version)
+	if err != nil || active.Version != first.Version {
+		t.Fatalf("initial activation = %#v, %v; want first version", active, err)
+	}
+	if _, _, err := store.ActivateAuthorizationModel(ctx, "acme", model.ID, "", second.Version); !errors.Is(err, rebac.ErrPreconditionFailed) {
+		t.Fatalf("stale activation error = %v; want ErrPreconditionFailed", err)
+	}
+	if _, secondActiveRevision, err := store.ActivateAuthorizationModel(ctx, "acme", model.ID, first.Version, second.Version); err != nil {
+		t.Fatal(err)
+	} else if document, err := store.ReadAuthorizationModelAtRevision(ctx, "acme", model.ID, secondActiveRevision); err != nil || document.Version != second.Version {
+		t.Fatalf("model at second activation = %#v, %v; want version %q", document, err, second.Version)
+	}
+	if active, err = store.ReadActiveAuthorizationModel(ctx, "acme", model.ID); err != nil || active.Version != second.Version {
+		t.Fatalf("active model = %#v, %v; want second version", active, err)
+	}
+	if _, rollbackRevision, err := store.ActivateAuthorizationModel(ctx, "acme", model.ID, second.Version, first.Version); err != nil {
+		t.Fatal(err)
+	} else if document, err := store.ReadAuthorizationModelAtRevision(ctx, "acme", model.ID, rollbackRevision); err != nil || document.Version != first.Version {
+		t.Fatalf("model at rollback = %#v, %v; want version %q", document, err, first.Version)
+	}
+	if active, err = store.ReadActiveAuthorizationModel(ctx, "acme", model.ID); err != nil || active.Version != first.Version {
+		t.Fatalf("rolled back model = %#v, %v; want first version", active, err)
+	}
+}
+
+func TestAuthorizationModelLifecycle(t *testing.T) {
+	store := kv.NewReBACStore(kv.New())
+	ctx := context.Background()
+	draft := rebac.ModelDocument{ID: "access", State: rebac.ModelDraft, Model: rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}}}
+	storedDraft, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", draft, "")
+	if err != nil || storedDraft.State != rebac.ModelDraft {
+		t.Fatalf("store draft = %#v, %v", storedDraft, err)
+	}
+	if _, _, err := store.ActivateAuthorizationModel(ctx, "acme", draft.ID, "", storedDraft.Version); !errors.Is(err, rebac.ErrModelNotPublished) {
+		t.Fatalf("activate draft error = %v; want ErrModelNotPublished", err)
+	}
+	published := draft
+	published.State = rebac.ModelPublished
+	storedPublished, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", published, storedDraft.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active, _, err := store.ActivateAuthorizationModel(ctx, "acme", draft.ID, "", storedPublished.Version); err != nil || active.State != rebac.ModelPublished {
+		t.Fatalf("activate published = %#v, %v", active, err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/surya-mp/go-rebac"
 )
@@ -39,16 +40,17 @@ type watcher struct {
 }
 
 type rebacState struct {
-	Revision   uint64                           `json:"revision"`
-	WatchAfter uint64                           `json:"watch_after,omitempty"`
-	Tuples     []rebac.RelationTuple            `json:"tuples"`
-	Models     map[string][]rebac.ModelDocument `json:"models"`
-	Events     []rebac.WatchEvent               `json:"events,omitempty"`
-	ByObject   map[string][]int                 `json:"by_object,omitempty"`
-	BySubject  map[string][]int                 `json:"by_subject,omitempty"`
-	Resources  map[string][]string              `json:"resources,omitempty"`
-	Subjects   map[string][]string              `json:"subjects,omitempty"`
-	Deleted    map[string]bool                  `json:"deleted,omitempty"`
+	Revision     uint64                           `json:"revision"`
+	WatchAfter   uint64                           `json:"watch_after,omitempty"`
+	Tuples       []rebac.RelationTuple            `json:"tuples"`
+	Models       map[string][]rebac.ModelDocument `json:"models"`
+	ActiveModels map[string]rebac.Revision        `json:"active_models,omitempty"`
+	Events       []rebac.WatchEvent               `json:"events,omitempty"`
+	ByObject     map[string][]int                 `json:"by_object,omitempty"`
+	BySubject    map[string][]int                 `json:"by_subject,omitempty"`
+	Resources    map[string][]string              `json:"resources,omitempty"`
+	Subjects     map[string][]string              `json:"subjects,omitempty"`
+	Deleted      map[string]bool                  `json:"deleted,omitempty"`
 }
 
 // NewReBACStore uses an application-created KV database.
@@ -75,7 +77,7 @@ func (s *ReBACStore) stateAt(ctx context.Context, revision rebac.Revision) (reba
 		if revision != "" && err == nil {
 			err = rebac.ErrInvalidRevision
 		}
-		return rebacState{Models: map[string][]rebac.ModelDocument{}}, err
+		return rebacState{Models: map[string][]rebac.ModelDocument{}, ActiveModels: map[string]rebac.Revision{}}, err
 	}
 	var state rebacState
 	if err := json.Unmarshal(raw, &state); err != nil {
@@ -86,6 +88,9 @@ func (s *ReBACStore) stateAt(ctx context.Context, revision rebac.Revision) (reba
 	}
 	if state.Models == nil {
 		state.Models = map[string][]rebac.ModelDocument{}
+	}
+	if state.ActiveModels == nil {
+		state.ActiveModels = map[string]rebac.Revision{}
 	}
 	if state.Deleted == nil {
 		state.Deleted = make(map[string]bool)
@@ -536,6 +541,60 @@ func (s *ReBACStore) ReadAuthorizationModel(ctx context.Context, tenant, id stri
 	}
 	return rebac.ModelDocument{}, rebac.ErrModelNotFound
 }
+func (s *ReBACStore) ListAuthorizationModelVersions(ctx context.Context, tenant, id string) ([]rebac.ModelDocument, error) {
+	st, err := s.state(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := st.Models[tenant+"/"+id]
+	if len(items) == 0 {
+		return nil, rebac.ErrModelNotFound
+	}
+	return append([]rebac.ModelDocument(nil), items...), nil
+}
+func (s *ReBACStore) ReadActiveAuthorizationModel(ctx context.Context, tenant, id string) (rebac.ModelDocument, error) {
+	st, err := s.state(ctx)
+	if err != nil {
+		return rebac.ModelDocument{}, err
+	}
+	active := st.ActiveModels[tenant+"/"+id]
+	if active == "" {
+		return rebac.ModelDocument{}, rebac.ErrModelNotFound
+	}
+	for _, document := range st.Models[tenant+"/"+id] {
+		if document.Version == active {
+			return document, nil
+		}
+	}
+	return rebac.ModelDocument{}, rebac.ErrModelNotFound
+}
+func (s *ReBACStore) ActivateAuthorizationModel(ctx context.Context, tenant, id string, expectedActive, version rebac.Revision) (rebac.ModelDocument, rebac.Revision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.state(ctx)
+	if err != nil {
+		return rebac.ModelDocument{}, "", err
+	}
+	k := tenant + "/" + id
+	if st.ActiveModels[k] != expectedActive {
+		return rebac.ModelDocument{}, "", rebac.ErrPreconditionFailed
+	}
+	for _, document := range st.Models[k] {
+		if document.Version != version {
+			continue
+		}
+		if document.State != "" && document.State != rebac.ModelPublished {
+			return rebac.ModelDocument{}, "", rebac.ErrModelNotPublished
+		}
+		if version == expectedActive {
+			return document, currentRevision(st), nil
+		}
+		st.ActiveModels[k] = version
+		revision, err := s.save(ctx, st)
+		return document, revision, err
+	}
+	return rebac.ModelDocument{}, "", rebac.ErrModelNotFound
+}
 func (s *ReBACStore) ReadAuthorizationModelAtRevision(ctx context.Context, tenant, id string, rev rebac.Revision) (rebac.ModelDocument, error) {
 	st, err := s.stateAt(ctx, rev)
 	if err != nil {
@@ -543,6 +602,14 @@ func (s *ReBACStore) ReadAuthorizationModelAtRevision(ctx context.Context, tenan
 	}
 	items := st.Models[tenant+"/"+id]
 	if len(items) == 0 {
+		return rebac.ModelDocument{}, rebac.ErrModelNotFound
+	}
+	if active := st.ActiveModels[tenant+"/"+id]; active != "" {
+		for _, document := range items {
+			if document.Version == active {
+				return document, nil
+			}
+		}
 		return rebac.ModelDocument{}, rebac.ErrModelNotFound
 	}
 	return items[len(items)-1], nil
@@ -567,6 +634,19 @@ func (s *ReBACStore) WriteAuthorizationModelWithRevision(ctx context.Context, te
 		return d, "", rebac.ErrPreconditionFailed
 	}
 	d.Version = rebac.Revision(strconv.FormatUint(st.Revision+1, 10))
+	if len(items) != 0 {
+		d.ParentVersion = items[len(items)-1].Version
+	} else {
+		d.ParentVersion = ""
+	}
+	d.CreatedAtUnixNano = time.Now().UnixNano()
+	if d.State == "" {
+		d.State = rebac.ModelPublished
+	}
+	d.Checksum, e = d.ComputeChecksum()
+	if e != nil {
+		return d, "", e
+	}
 	st.Models[k] = append(items, d)
 	rev, e := s.save(ctx, st)
 	return d, rev, e
@@ -700,5 +780,10 @@ var _ rebac.StorageEngine = (*ReBACStore)(nil)
 var _ rebac.RevisionedStorage = (*ReBACStore)(nil)
 var _ rebac.MutationStorage = (*ReBACStore)(nil)
 var _ rebac.ModelStorage = (*ReBACStore)(nil)
+var _ rebac.ModelVersionLister = (*ReBACStore)(nil)
+var _ rebac.ActiveModelStorage = (*ReBACStore)(nil)
+var _ rebac.ResourceCandidateReader = (*ReBACStore)(nil)
+var _ rebac.SubjectCandidateReader = (*ReBACStore)(nil)
+var _ rebac.WatchStorage = (*ReBACStore)(nil)
 var _ rebac.ConsistentStorage = (*ReBACStore)(nil)
 var _ rebac.RevisionedModelStorage = (*ReBACStore)(nil)

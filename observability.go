@@ -15,6 +15,7 @@ const (
 	DecisionDenied         DecisionReason = "denied"
 	DecisionInvalidRequest DecisionReason = "invalid_request"
 	DecisionLimitExceeded  DecisionReason = "limit_exceeded"
+	DecisionCycleDetected  DecisionReason = "cycle_detected"
 	DecisionStorageError   DecisionReason = "storage_error"
 )
 
@@ -23,11 +24,15 @@ const (
 type CheckEvent struct {
 	TenantID, User, Relation, Namespace, ObjectID string
 	Revision                                      Revision
+	ModelID                                       string
+	ModelVersion                                  Revision
 	Allowed                                       bool
 	Reason                                        DecisionReason
 	Err                                           error
 	Duration                                      time.Duration
-	Nodes                                         int
+	Nodes, MaxDepth, Branches, Cycles             int
+	StorageCalls, TuplesRead, CacheHits           int
+	CacheHit                                      bool
 }
 
 // MutationEvent is emitted after each write, delete, or batch mutation.
@@ -42,6 +47,41 @@ type MutationEvent struct {
 type Observer interface {
 	ObserveCheck(context.Context, CheckEvent)
 	ObserveMutation(context.Context, MutationEvent)
+}
+
+// ObserverFuncs adapts ordinary functions to the production Observer contract.
+// It keeps metrics and tracing integrations optional and dependency-free.
+type ObserverFuncs struct {
+	Check    func(context.Context, CheckEvent)
+	Mutation func(context.Context, MutationEvent)
+}
+
+func (o ObserverFuncs) ObserveCheck(ctx context.Context, event CheckEvent) {
+	if o.Check != nil {
+		o.Check(ctx, event)
+	}
+}
+
+func (o ObserverFuncs) ObserveMutation(ctx context.Context, event MutationEvent) {
+	if o.Mutation != nil {
+		o.Mutation(ctx, event)
+	}
+}
+
+// DebugObserver receives privileged evaluation explanations separately from
+// production events. Explanations reveal relationship tuples and must not be
+// attached to normal metrics or audit sinks.
+type DebugObserver interface {
+	ObserveExplanation(context.Context, Explanation)
+}
+
+// DebugObserverFunc adapts a function to DebugObserver.
+type DebugObserverFunc func(context.Context, Explanation)
+
+func (f DebugObserverFunc) ObserveExplanation(ctx context.Context, explanation Explanation) {
+	if f != nil {
+		f(ctx, explanation)
+	}
 }
 
 // Stats is a lock-free process-local counter snapshot.

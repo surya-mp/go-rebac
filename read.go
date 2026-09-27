@@ -80,12 +80,15 @@ type SubjectPage struct {
 // Expansion represents direct relationship edges and nested usersets for one
 // relation. Rewrite describes the model operation applied at this node.
 type Expansion struct {
-	Namespace string          `json:"namespace"`
-	ObjectID  string          `json:"object_id"`
-	Relation  string          `json:"relation"`
-	Rewrite   Rewrite         `json:"rewrite"`
-	Tuples    []RelationTuple `json:"tuples"`
-	Children  []Expansion     `json:"children"`
+	Namespace    string          `json:"namespace"`
+	ObjectID     string          `json:"object_id"`
+	Relation     string          `json:"relation"`
+	Revision     Revision        `json:"revision,omitempty"`
+	ModelID      string          `json:"model_id,omitempty"`
+	ModelVersion Revision        `json:"model_version,omitempty"`
+	Rewrite      Rewrite         `json:"rewrite"`
+	Tuples       []RelationTuple `json:"tuples"`
+	Children     []Expansion     `json:"children"`
 }
 
 // ReadTuples returns a page of model-valid tuples. It is intended for
@@ -223,7 +226,12 @@ func (e *Engine) LookupResources(ctx context.Context, request LookupResourcesReq
 		candidates = uniqueObjectIDs(tuples)
 	}
 	allowed := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
 	for _, objectID := range candidates {
+		if _, duplicate := seen[objectID]; duplicate {
+			continue
+		}
+		seen[objectID] = struct{}{}
 		ok, _, err := e.CheckWithRevisionAt(ctx, revision, request.CaveatContext, request.AsOfUnixNano, request.TenantID, request.User, request.Relation, request.Namespace, objectID)
 		if err != nil {
 			return ResourcePage{}, err
@@ -314,6 +322,9 @@ func (e *Engine) ExpandAt(ctx context.Context, revision Revision, asOfUnixNano i
 		expansion, token, err := e.ExpandWithConsistencyAt(ctx, consistencyTokenForRevision(e, tenantID, revision), asOfUnixNano, tenantID, relation, namespace, objectID)
 		return expansion, token.TupleRevision, err
 	}
+	if e == nil || e.store == nil {
+		return Expansion{}, "", errors.New("rebac: storage engine is nil")
+	}
 	if err := e.validateTenant(tenantID); err != nil {
 		return Expansion{}, "", err
 	}
@@ -325,17 +336,29 @@ func (e *Engine) ExpandAt(ctx context.Context, revision Revision, asOfUnixNano i
 		return Expansion{}, "", err
 	}
 	defer release()
-	expansion, err := e.expand(ctx, reader, withAsOf(nil, asOfUnixNano), tenantID, relation, namespace, objectID, make(map[checkKey]struct{}), 0)
+	reader = &memoReader{reader: reader, cache: make(map[tupleFilterKey][]RelationTuple), maxTuples: e.maxTuplesRead, maxCalls: e.maxStorageCalls}
+	expansion, err := e.expand(ctx, reader, withAsOf(nil, asOfUnixNano), tenantID, relation, namespace, objectID, used, make(map[checkKey]struct{}), 0, new(int), new(int))
 	return expansion, used, err
 }
 
-func (e *Engine) expand(ctx context.Context, reader TupleReader, caveatContext CaveatContext, tenantID, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int) (Expansion, error) {
+func (e *Engine) expand(ctx context.Context, reader TupleReader, caveatContext CaveatContext, tenantID, relation, namespace, objectID string, revision Revision, visiting map[checkKey]struct{}, depth int, nodes, output *int) (Expansion, error) {
+	if err := ctx.Err(); err != nil {
+		return Expansion{}, err
+	}
 	if depth > e.maxDepth {
 		return Expansion{}, ErrMaxDepthExceeded
 	}
+	if *nodes >= e.maxNodes {
+		return Expansion{}, ErrMaxNodesExceeded
+	}
+	(*nodes)++
+	if *output >= e.maxExpansionOutput {
+		return Expansion{}, ErrMaxExpansionOutput
+	}
+	(*output)++
 	key := checkKey{tenantID: tenantID, relation: relation, namespace: namespace, objectID: objectID}
 	if _, ok := visiting[key]; ok {
-		return Expansion{Namespace: namespace, ObjectID: objectID, Relation: relation}, nil
+		return Expansion{}, ErrCycleDetected
 	}
 	visiting[key] = struct{}{}
 	defer delete(visiting, key)
@@ -346,6 +369,9 @@ func (e *Engine) expand(ctx context.Context, reader TupleReader, caveatContext C
 	}
 	active := tuples[:0]
 	for _, tuple := range tuples {
+		if err := ctx.Err(); err != nil {
+			return Expansion{}, err
+		}
 		applies, err := e.evaluateCaveat(ctx, tuple, caveatContext)
 		if err != nil {
 			return Expansion{}, err
@@ -355,13 +381,17 @@ func (e *Engine) expand(ctx context.Context, reader TupleReader, caveatContext C
 		}
 	}
 	tuples = active
-	expansion := Expansion{Namespace: namespace, ObjectID: objectID, Relation: relation, Rewrite: e.model.Namespaces[namespace].Relations[relation].Rewrite, Tuples: tuples}
+	if len(tuples) > e.maxExpansionOutput-*output {
+		return Expansion{}, ErrMaxExpansionOutput
+	}
+	*output += len(tuples)
+	expansion := Expansion{Namespace: namespace, ObjectID: objectID, Relation: relation, Revision: revision, ModelID: e.modelID, ModelVersion: e.modelVersion, Rewrite: e.model.Namespaces[namespace].Relations[relation].Rewrite, Tuples: tuples}
 	for _, tuple := range tuples {
 		childNamespace, childObjectID, childRelation, ok := parseUserset(tuple.User)
 		if !ok {
 			continue
 		}
-		child, err := e.expand(ctx, reader, caveatContext, tenantID, childRelation, childNamespace, childObjectID, visiting, depth+1)
+		child, err := e.expand(ctx, reader, caveatContext, tenantID, childRelation, childNamespace, childObjectID, revision, visiting, depth+1, nodes, output)
 		if err != nil {
 			return Expansion{}, err
 		}

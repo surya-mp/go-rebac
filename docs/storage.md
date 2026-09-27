@@ -100,3 +100,12 @@ For a strict implementation, use `conformance.RunConsistent` and provide both
 the tuple store and `RevisionedModelStorage`. This verifies the public
 protocol; database replication and external-consistency guarantees still need
 database-specific integration and fault tests.
+
+Run `conformance.RunRevisioned`, `conformance.RunMutations`, and
+`conformance.RunModelStorage` independently for each optional capability your
+adapter claims. Also run `RunActiveModels`, `RunCandidateReaders`, and
+`RunWatches` for those respective capabilities. `RunConsistent` remains the
+full strict-protocol suite.
+
+See [migrations.md](migrations.md) for versioning, rollout, backup, rollback,
+and index-verification requirements for external adapters.

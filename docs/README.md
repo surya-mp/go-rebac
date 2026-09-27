@@ -8,12 +8,18 @@ transport, and any external-database integration.
 
 | Need | Start here |
 | --- | --- |
-| Add ReBAC checks to one Go application | [Getting started](getting-started.md) |
+| Add ReBAC checks to one Go application | [Five-minute quickstart](getting-started.md) |
 | Design namespaces, relations, and rewrites | [Modeling guide](modeling.md) |
+| Learn the evaluator's normative behavior | [Authorization semantics](semantics.md) |
+| Understand component ownership | [Architecture](architecture.md) |
+| Review API compatibility rules | [API stability](api-stability.md) |
 | Implement a database store | [Storage guide](storage.md) |
+| Verify an adapter's guarantees | [Storage adapters](storage-adapters.md) |
+| Migrate an external adapter safely | [Migration guide](migrations.md) |
 | Prevent stale ACL checks after content changes | [Consistency guide](consistency.md) |
 | Expose the optional HTTP handlers | [HTTP guide](http.md) |
 | Test or operate a production integration | [Testing and operations](operations.md) |
+| Review deployment security boundaries | [Threat model](security/threat-model.md) |
 | Find an exported symbol | [API guide](api.md) |
 
 ## Ownership boundary

@@ -99,7 +99,7 @@ func (e *Engine) WatchCacheInvalidation(ctx context.Context, tenantID string, af
 	return revisions, errorsCh
 }
 
-func decisionCacheKey(revision Revision, tenantID, user, relation, namespace, objectID string, caveatContext CaveatContext) (string, bool) {
+func decisionCacheKey(modelID string, modelVersion Revision, modelHash string, revision Revision, tenantID, user, relation, namespace, objectID string, caveatContext CaveatContext) (string, bool) {
 	if revision == "" {
 		return "", false
 	}
@@ -107,5 +107,5 @@ func decisionCacheKey(revision Revision, tenantID, user, relation, namespace, ob
 	if err != nil {
 		return "", false
 	}
-	return tenantID + "\x00" + string(revision) + "\x00" + user + "\x00" + relation + "\x00" + namespace + "\x00" + objectID + "\x00" + string(context), true
+	return tenantID + "\x00" + modelID + "\x00" + string(modelVersion) + "\x00" + modelHash + "\x00" + string(revision) + "\x00" + user + "\x00" + relation + "\x00" + namespace + "\x00" + objectID + "\x00" + string(context), true
 }

@@ -3,8 +3,11 @@ package rebac
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 type memoryStore []RelationTuple
@@ -43,6 +46,38 @@ func tupleEqual(a, b RelationTuple) bool {
 		a.Relation == b.Relation && a.User == b.User && a.Caveat == b.Caveat && reflect.DeepEqual(a.CaveatContext, b.CaveatContext)
 }
 
+type fixedStore struct {
+	tuples []RelationTuple
+	err    error
+}
+
+func (s fixedStore) QueryTuples(_ context.Context, _ RelationTuple) ([]RelationTuple, error) {
+	return s.tuples, s.err
+}
+func (fixedStore) WriteTuple(context.Context, RelationTuple) error  { return nil }
+func (fixedStore) DeleteTuple(context.Context, RelationTuple) error { return nil }
+
+type blockingStore struct{}
+
+func (blockingStore) QueryTuples(ctx context.Context, _ RelationTuple) ([]RelationTuple, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (blockingStore) WriteTuple(context.Context, RelationTuple) error  { return nil }
+func (blockingStore) DeleteTuple(context.Context, RelationTuple) error { return nil }
+
+type failingSnapshotStore struct{ memoryStore }
+
+func (failingSnapshotStore) SnapshotAt(context.Context, Revision) (TupleReader, Revision, func() error, error) {
+	return nil, "", nil, errors.New("snapshot unavailable")
+}
+func (failingSnapshotStore) WriteTupleWithRevision(context.Context, RelationTuple) (Revision, error) {
+	return "", errors.New("write unavailable")
+}
+func (failingSnapshotStore) DeleteTupleWithRevision(context.Context, RelationTuple) (Revision, error) {
+	return "", errors.New("delete unavailable")
+}
+
 func TestCheckDirectNestedAndCycle(t *testing.T) {
 	store := memoryStore{
 		{TenantID: "acme", Namespace: "document", ObjectID: "direct", Relation: "viewer", User: "user:alice"},
@@ -60,13 +95,121 @@ func TestCheckDirectNestedAndCycle(t *testing.T) {
 	for _, test := range []struct {
 		objectID string
 		want     bool
+		wantErr  error
 	}{
-		{"direct", true}, {"nested", true}, {"cycle", false},
+		{"direct", true, nil}, {"nested", true, nil}, {"cycle", false, ErrCycleDetected},
 	} {
 		got, err := engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", test.objectID)
-		if err != nil || got != test.want {
-			t.Fatalf("Check(%q) = %v, %v; want %v, nil", test.objectID, got, err, test.want)
+		if !errors.Is(err, test.wantErr) || got != test.want {
+			t.Fatalf("Check(%q) = %v, %v; want %v, %v", test.objectID, got, err, test.want, test.wantErr)
 		}
+	}
+}
+
+func TestExplainUsesCheckTraversalAndRedactsCaveatContext(t *testing.T) {
+	model := testModel()
+	model.Caveats = map[string]CaveatDefinition{
+		"approved": {Evaluate: func(_ context.Context, tuple, request CaveatContext) (bool, error) {
+			return tuple["team"] == request["team"], nil
+		}},
+	}
+	store := memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "group:eng#member", Caveat: "approved", CaveatContext: CaveatContext{"team": "eng"}},
+		{TenantID: "acme", Namespace: "group", ObjectID: "eng", Relation: "member", User: "user:alice"},
+	}
+	engine, err := NewEngine(&store, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explanation, err := engine.Explain(context.Background(), ExplainRequest{
+		TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document", ObjectID: "plan", CaveatContext: CaveatContext{"team": "eng"},
+	})
+	if err != nil || !explanation.Allowed || len(explanation.Nodes) != 2 {
+		t.Fatalf("Explain() = %#v, %v", explanation, err)
+	}
+	root, nested := explanation.Nodes[0], explanation.Nodes[1]
+	if !root.Allowed || len(root.Tuples) != 1 || !root.Tuples[0].Applies || !root.Tuples[0].Matched || root.Tuples[0].Tuple.CaveatContext != nil {
+		t.Fatalf("root explanation = %#v", root)
+	}
+	if nested.Namespace != "group" || nested.Relation != "member" || !nested.Allowed || len(nested.Tuples) != 1 || !nested.Tuples[0].Matched {
+		t.Fatalf("nested explanation = %#v", nested)
+	}
+}
+
+func TestCheckFailsClosed(t *testing.T) {
+	storageFailure := errors.New("unavailable")
+	engine, err := NewEngine(fixedStore{err: storageFailure}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrStorage) {
+		t.Fatalf("storage Check() = %v, %v; want false, ErrStorage", allowed, err)
+	}
+	engine, err = NewEngine(fixedStore{err: context.DeadlineExceeded}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled storage Check() = %v, %v; want false, context.DeadlineExceeded", allowed, err)
+	}
+	engine, err = NewEngine(&failingSnapshotStore{}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, _, err = engine.CheckWithRevision(context.Background(), "42", "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrStorage) {
+		t.Fatalf("snapshot failure Check() = %v, %v; want false, ErrStorage", allowed, err)
+	}
+
+	model := testModel()
+	model.Caveats = map[string]CaveatDefinition{
+		"broken": {Evaluate: func(context.Context, CaveatContext, CaveatContext) (bool, error) { return false, storageFailure }},
+	}
+	engine, err = NewEngine(fixedStore{tuples: []RelationTuple{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice", Caveat: "broken"}}}, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, storageFailure) {
+		t.Fatalf("caveat Check() = %v, %v; want false, caveat error", allowed, err)
+	}
+
+	engine, err = NewEngine(fixedStore{tuples: []RelationTuple{{TenantID: "other", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}}}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrCrossTenantTuple) {
+		t.Fatalf("cross-tenant Check() = %v, %v; want false, ErrCrossTenantTuple", allowed, err)
+	}
+}
+
+func TestCheckLargeGraph(t *testing.T) {
+	tuples := make(memoryStore, 10_000)
+	for i := range tuples {
+		tuples[i] = RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "large", Relation: "viewer", User: "user:" + fmt.Sprint(i)}
+	}
+	tuples[len(tuples)-1].User = "user:alice"
+	engine, err := NewEngine(&tuples, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", "large")
+	if err != nil || !allowed {
+		t.Fatalf("large graph Check() = %v, %v; want true, nil", allowed, err)
+	}
+}
+
+func TestCheckRejectsOversizedCaveatContext(t *testing.T) {
+	engine, err := NewEngine(&memoryStore{}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := engine.CheckWithContext(context.Background(), CaveatContext{"value": strings.Repeat("a", maxCaveatContextSize)}, "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("CheckWithContext() = %v, %v; want false, ErrInvalidRequest", allowed, err)
 	}
 }
 
@@ -141,11 +284,75 @@ func TestCheckStopsAtLimit(t *testing.T) {
 	}
 }
 
+func TestExpandUsesGraphBounds(t *testing.T) {
+	store := memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "group:eng#member"},
+		{TenantID: "acme", Namespace: "group", ObjectID: "eng", Relation: "member", User: "user:alice"},
+	}
+	engine, err := NewEngine(&store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := engine.WithEvaluationLimits(EvaluationLimits{MaxStorageCalls: 1}).Expand(context.Background(), "", "acme", "viewer", "document", "plan"); !errors.Is(err, ErrMaxStorageCalls) {
+		t.Fatalf("Expand() error = %v; want ErrMaxStorageCalls", err)
+	}
+	if _, _, err := engine.WithEvaluationLimits(EvaluationLimits{MaxExpansionOutput: 1}).Expand(context.Background(), "", "acme", "viewer", "document", "plan"); !errors.Is(err, ErrMaxExpansionOutput) {
+		t.Fatalf("Expand() error = %v; want ErrMaxExpansionOutput", err)
+	}
+}
+
+func TestCheckEvaluationBudgetsAndCancellation(t *testing.T) {
+	store := memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"},
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:bob"},
+	}
+	engine, err := NewEngine(&store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := engine.WithEvaluationLimits(EvaluationLimits{MaxTuplesRead: 1}).Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrMaxTuplesRead) {
+		t.Fatalf("tuple-budget Check() = %v, %v; want false, ErrMaxTuplesRead", allowed, err)
+	}
+
+	store = memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "group:eng#member"},
+		{TenantID: "acme", Namespace: "group", ObjectID: "eng", Relation: "member", User: "user:alice"},
+	}
+	engine, err = NewEngine(&store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = engine.WithEvaluationLimits(EvaluationLimits{MaxStorageCalls: 1}).Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrMaxStorageCalls) {
+		t.Fatalf("call-budget Check() = %v, %v; want false, ErrMaxStorageCalls", allowed, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	allowed, err = engine.Check(ctx, "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Check() = %v, %v; want false, context.Canceled", allowed, err)
+	}
+}
+
+func TestCheckEvaluationTimeBudget(t *testing.T) {
+	engine, err := NewEngine(blockingStore{}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := engine.WithEvaluationLimits(EvaluationLimits{MaxEvaluationTime: time.Millisecond}).Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan")
+	if allowed || !errors.Is(err, ErrMaxEvaluationTime) {
+		t.Fatalf("time-budget Check() = %v, %v; want false, ErrMaxEvaluationTime", allowed, err)
+	}
+}
+
 func TestCheckAtValidityIntervalAndWildcard(t *testing.T) {
 	model := testModel()
 	document := model.Namespaces["document"]
 	viewer := document.Relations["viewer"]
 	viewer.AllowWildcard = true
+	viewer.AllowedSubjects = append(viewer.AllowedSubjects, SubjectReference{Namespace: "group"})
 	document.Relations["viewer"] = viewer
 	model.Namespaces["document"] = document
 	store := &snapshotMemoryStore{}
@@ -187,6 +394,32 @@ func TestCheckAtValidityIntervalAndWildcard(t *testing.T) {
 	}
 	if allowed, err := engine.Check(ctx, "acme", "user:bob", "viewer", "document", "public"); err != nil || !allowed {
 		t.Fatalf("wildcard Check() = %v, %v; want true, nil", allowed, err)
+	}
+	if err := engine.WriteTuple(ctx, RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "public", Relation: "viewer", User: "group:*"}); !errors.Is(err, ErrInvalidTuple) {
+		t.Fatalf("group wildcard error = %v; want ErrInvalidTuple", err)
+	}
+}
+
+func TestLookupUsesCheckSemanticsWithoutAsOf(t *testing.T) {
+	model := testModel()
+	model.Caveats = map[string]CaveatDefinition{
+		"ordinary": {Evaluate: func(_ context.Context, _ CaveatContext, request CaveatContext) (bool, error) {
+			_, hasAsOf := request[asOfContextKey]
+			return !hasAsOf, nil
+		}},
+	}
+	store := memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice", Caveat: "ordinary"}}
+	engine, err := NewEngine(&store, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := engine.LookupResources(context.Background(), LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document"})
+	if err != nil || !reflect.DeepEqual(resources.ObjectIDs, []string{"plan"}) {
+		t.Fatalf("LookupResources() = %#v, %v", resources, err)
+	}
+	subjects, err := engine.LookupSubjects(context.Background(), LookupSubjectsRequest{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", SubjectNamespace: "user"})
+	if err != nil || !reflect.DeepEqual(subjects.Subjects, []string{"user:alice"}) {
+		t.Fatalf("LookupSubjects() = %#v, %v", subjects, err)
 	}
 }
 
@@ -320,6 +553,10 @@ func TestRelationRewrites(t *testing.T) {
 			"access": {Rewrite: Rewrite{Exclusion: &Exclusion{
 				Base: Rewrite{ComputedUserset: "editor"}, Subtract: Rewrite{ComputedUserset: "blocked"},
 			}}},
+			"eligible": {Rewrite: Rewrite{Exclusion: &Exclusion{
+				Base:     Rewrite{Union: []Rewrite{{ComputedUserset: "editor"}, {ComputedUserset: "reviewer"}}},
+				Subtract: Rewrite{ComputedUserset: "blocked"},
+			}}},
 			"via_parent": {Rewrite: Rewrite{TupleToUserset: &TupleToUserset{Tupleset: "parent", ComputedUserset: "viewer"}}},
 		}},
 	}}
@@ -343,6 +580,7 @@ func TestRelationRewrites(t *testing.T) {
 		{"user:alice", "any", true}, {"user:bob", "any", true},
 		{"user:alice", "all", true}, {"user:bob", "all", false},
 		{"user:alice", "access", true}, {"user:bob", "access", false},
+		{"user:alice", "eligible", true}, {"user:bob", "eligible", false},
 		{"user:carol", "via_parent", true},
 	} {
 		allowed, err := engine.Check(context.Background(), "acme", test.user, test.relation, "document", "plan")
@@ -404,7 +642,7 @@ func TestReadLookupAndExpand(t *testing.T) {
 		t.Fatalf("LookupSubjects() = %#v, %v", subjects, err)
 	}
 	expansion, revision, err := engine.Expand(context.Background(), "42", "acme", "viewer", "document", "b")
-	if err != nil || revision != "42" || len(expansion.Tuples) != 2 || len(expansion.Children) != 1 {
+	if err != nil || revision != "42" || expansion.Revision != "42" || len(expansion.Tuples) != 2 || len(expansion.Children) != 1 || expansion.Children[0].Revision != "42" {
 		t.Fatalf("Expand() = %#v, %q, %v", expansion, revision, err)
 	}
 }
@@ -412,11 +650,17 @@ func TestReadLookupAndExpand(t *testing.T) {
 type testObserver struct {
 	checks, mutations int
 	lastReason        DecisionReason
+	lastCheck         CheckEvent
 }
+
+type testDebugObserver struct{ explanations int }
+
+func (o *testDebugObserver) ObserveExplanation(context.Context, Explanation) { o.explanations++ }
 
 func (o *testObserver) ObserveCheck(_ context.Context, event CheckEvent) {
 	o.checks++
 	o.lastReason = event.Reason
+	o.lastCheck = event
 }
 
 func (o *testObserver) ObserveMutation(context.Context, MutationEvent) { o.mutations++ }
@@ -440,8 +684,104 @@ func TestObserverStatsAndBatchReads(t *testing.T) {
 		t.Fatalf("ReadTuplesBatch() = %#v, %v", batch, err)
 	}
 	stats := engine.Stats()
-	if observer.checks != 1 || observer.lastReason != DecisionAllowed || stats.Checks != 1 || stats.Allowed != 1 {
+	if observer.checks != 1 || observer.lastReason != DecisionAllowed || observer.lastCheck.Nodes != 1 || observer.lastCheck.StorageCalls != 1 || observer.lastCheck.TuplesRead != 1 || stats.Checks != 1 || stats.Allowed != 1 {
 		t.Fatalf("observer/stats = %#v, %#v", observer, stats)
+	}
+}
+
+func TestDebugObserverReceivesOnlyExplainTraces(t *testing.T) {
+	store := memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}}
+	debug := &testDebugObserver{}
+	engine, err := NewEngine(&store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine = engine.WithDebugObserver(debug)
+	if _, err := engine.Check(context.Background(), "acme", "user:alice", "viewer", "document", "plan"); err != nil {
+		t.Fatal(err)
+	}
+	if debug.explanations != 0 {
+		t.Fatalf("debug observer after Check = %d; want 0", debug.explanations)
+	}
+	if _, err := engine.Explain(context.Background(), ExplainRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document", ObjectID: "plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if debug.explanations != 1 {
+		t.Fatalf("debug observer after Explain = %d; want 1", debug.explanations)
+	}
+}
+
+func TestDecisionCacheIsolatesCompiledModels(t *testing.T) {
+	store := &revisionMemoryStore{memoryStore: memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}}, revision: "42"}
+	cache := NewMemoryDecisionCache()
+	first, err := NewEngine(store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondModel := testModel()
+	document := secondModel.Namespaces["document"]
+	document.Relations["owner"] = RelationDefinition{AllowedSubjects: []SubjectReference{{Namespace: "user"}}}
+	viewer := document.Relations["viewer"]
+	viewer.Rewrite = Rewrite{ComputedUserset: "owner"}
+	document.Relations["viewer"] = viewer
+	secondModel.Namespaces["document"] = document
+	second, err := NewEngine(store, secondModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, _, err := first.WithDecisionCache(cache).CheckWithRevision(context.Background(), "42", "acme", "user:alice", "viewer", "document", "plan")
+	if err != nil || !allowed {
+		t.Fatalf("first cached check = %v, %v", allowed, err)
+	}
+	allowed, _, err = second.WithDecisionCache(cache).CheckWithRevision(context.Background(), "42", "acme", "user:alice", "viewer", "document", "plan")
+	if err != nil || allowed {
+		t.Fatalf("second model cache isolation = %v, %v; want false, nil", allowed, err)
+	}
+}
+
+func TestDecisionCacheCachesDenialsAndIsolatesTenants(t *testing.T) {
+	store := &revisionMemoryStore{revision: "42"}
+	cache := NewMemoryDecisionCache()
+	observer := &testObserver{}
+	engine, err := NewEngine(store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine = engine.WithDecisionCache(cache).WithObserver(observer)
+	for i, tenant := range []string{"acme", "acme", "other"} {
+		allowed, _, err := engine.CheckWithRevision(context.Background(), "42", tenant, "user:alice", "viewer", "document", "plan")
+		if err != nil || allowed {
+			t.Fatalf("cached denial for %q = %v, %v; want false, nil", tenant, allowed, err)
+		}
+		if observer.lastCheck.CacheHit != (i == 1) {
+			t.Fatalf("cache hit for %q = %v; want %v", tenant, observer.lastCheck.CacheHit, i == 1)
+		}
+	}
+}
+
+func TestWatchCacheInvalidationClearsTenantEntries(t *testing.T) {
+	store := &revisionMemoryStore{memoryStore: memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}}, revision: "42"}
+	cache := NewMemoryDecisionCache()
+	engine, err := NewEngine(store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine = engine.WithDecisionCache(cache)
+	if allowed, _, err := engine.CheckWithRevision(context.Background(), "42", "acme", "user:alice", "viewer", "document", "plan"); err != nil || !allowed {
+		t.Fatalf("cached CheckWithRevision() = %v, %v", allowed, err)
+	}
+	revisions, errorsCh := engine.WatchCacheInvalidation(context.Background(), "acme", "")
+	if revision, ok := <-revisions; !ok || revision != "42" {
+		t.Fatalf("cache invalidation revision = %q, open=%v", revision, ok)
+	}
+	if err, ok := <-errorsCh; ok || err != nil {
+		t.Fatalf("cache invalidation error = %v, open=%v", err, ok)
+	}
+	cache.mu.RLock()
+	entries := len(cache.entries)
+	cache.mu.RUnlock()
+	if entries != 0 {
+		t.Fatalf("cache entries after invalidation = %d; want 0", entries)
 	}
 }
 
@@ -512,7 +852,7 @@ func TestLookupUsesIndexedCandidates(t *testing.T) {
 			},
 			revision: "42",
 		},
-		resources: []string{"plan"},
+		resources: []string{"plan", "plan"},
 		subjects:  []string{"user:alice", "user:bob"},
 	}
 	engine, err := NewEngine(store, testModel())
@@ -549,9 +889,13 @@ func TestConsistentEnginePinsModelAndTupleSnapshots(t *testing.T) {
 	if err != nil || !allowed || token.TupleRevision != "42" || token.ModelVersion != "7" {
 		t.Fatalf("ContentChangeCheck() = %v, %#v, %v", allowed, token, err)
 	}
-	allowed, token, err = engine.CheckWithConsistency(context.Background(), token, "acme", "user:alice", "viewer", "document", "plan")
+	observer := &testObserver{}
+	allowed, token, err = engine.WithObserver(observer).CheckWithConsistency(context.Background(), token, "acme", "user:alice", "viewer", "document", "plan")
 	if err != nil || !allowed || token.TupleRevision != "42" {
 		t.Fatalf("CheckWithConsistency() = %v, %#v, %v", allowed, token, err)
+	}
+	if observer.lastCheck.ModelID != "document_access" || observer.lastCheck.ModelVersion != "7" || observer.lastCheck.StorageCalls != 1 || observer.lastCheck.TuplesRead != 1 {
+		t.Fatalf("consistent CheckEvent = %#v", observer.lastCheck)
 	}
 	resources, _, err := engine.LookupResourcesWithConsistency(context.Background(), token, LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document"})
 	if err != nil || !reflect.DeepEqual(resources.ObjectIDs, []string{"plan"}) {
@@ -567,8 +911,41 @@ func TestConsistentEnginePinsModelAndTupleSnapshots(t *testing.T) {
 	if _, _, err := engine.CheckWithConsistency(context.Background(), ConsistencyToken{TenantID: "other", ModelID: "document_access", TupleRevision: "42"}, "acme", "user:alice", "viewer", "document", "plan"); !errors.Is(err, ErrInvalidRevision) {
 		t.Fatalf("cross-tenant token error = %v; want ErrInvalidRevision", err)
 	}
+	store.memoryStore = memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "group:eng#member"},
+		{TenantID: "acme", Namespace: "group", ObjectID: "eng", Relation: "member", User: "user:alice"},
+	}
+	if allowed, _, err := engine.WithEvaluationLimits(EvaluationLimits{MaxStorageCalls: 1}).CheckWithConsistency(context.Background(), ConsistencyToken{}, "acme", "user:alice", "viewer", "document", "plan"); allowed || !errors.Is(err, ErrMaxStorageCalls) {
+		t.Fatalf("consistent storage-call budget = %v, %v; want false, ErrMaxStorageCalls", allowed, err)
+	}
 	store.indexedAt = "41"
 	if _, _, err := engine.LookupResourcesWithConsistency(context.Background(), token, LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document"}); !errors.Is(err, ErrIndexSnapshot) {
 		t.Fatalf("stale lookup index error = %v; want ErrIndexSnapshot", err)
+	}
+}
+
+func TestConsistentEngineCachesCompiledModels(t *testing.T) {
+	store := &indexedMemoryStore{
+		revisionMemoryStore: &revisionMemoryStore{revision: "42"},
+	}
+	models := staticModelStorage{document: ModelDocument{ID: "document_access", Version: "7", Model: testModel()}}
+	engine, _, err := NewConsistentEngineFromModelStorage(context.Background(), store, models, ModelSelection{TenantID: "acme", ModelID: "document_access"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, _, release, err := engine.consistencyView(context.Background(), ConsistencyToken{}, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	second, _, _, release, err := engine.consistencyView(context.Background(), ConsistencyToken{}, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if first.compiledModel != second.compiledModel {
+		t.Fatal("consistent views did not reuse the compiled model")
 	}
 }

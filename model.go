@@ -2,8 +2,10 @@ package rebac
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -52,6 +54,117 @@ type SubjectReference struct {
 	Relation  string `json:"relation,omitempty"`
 }
 
+// LintSeverity classifies a non-blocking model diagnostic.
+type LintSeverity string
+
+const (
+	LintError   LintSeverity = "error"
+	LintWarning LintSeverity = "warning"
+	LintInfo    LintSeverity = "info"
+)
+
+// ModelLintIssue identifies an invalid or suspicious model definition.
+type ModelLintIssue struct {
+	Severity LintSeverity
+	Path     string
+	Message  string
+}
+
+// CompiledModel is an immutable, thread-safe authorization model prepared for
+// evaluation. Its dependency metadata is useful for linting and diagnostics.
+type CompiledModel struct {
+	model               AuthorizationModel
+	dependencies        map[string][]string
+	reverseDependencies map[string][]string
+}
+
+// CompileModel validates, normalizes, and clones a model for reuse by one or
+// more Engines.
+func CompileModel(model AuthorizationModel) (*CompiledModel, error) {
+	compiled, err := model.compile()
+	if err != nil {
+		return nil, err
+	}
+	dependencies := make(map[string][]string)
+	for _, namespace := range sortedNamespaces(compiled.Namespaces) {
+		for _, relation := range sortedRelations(compiled.Namespaces[namespace].Relations) {
+			name := namespace + "#" + relation
+			set := make(map[string]struct{})
+			definition := compiled.Namespaces[namespace].Relations[relation]
+			for _, subject := range definition.AllowedSubjects {
+				if subject.Relation != "" {
+					set[subject.Namespace+"#"+subject.Relation] = struct{}{}
+				}
+			}
+			collectRewriteDependencies(compiled, namespace, definition.Rewrite, set)
+			dependencies[name] = sortedDependencyNames(set)
+		}
+	}
+	reverse := make(map[string]map[string]struct{}, len(dependencies))
+	for name := range dependencies {
+		reverse[name] = make(map[string]struct{})
+	}
+	for name, targets := range dependencies {
+		for _, target := range targets {
+			reverse[target][name] = struct{}{}
+		}
+	}
+	reverseDependencies := make(map[string][]string, len(reverse))
+	for name, sources := range reverse {
+		reverseDependencies[name] = sortedDependencyNames(sources)
+	}
+	return &CompiledModel{model: compiled, dependencies: dependencies, reverseDependencies: reverseDependencies}, nil
+}
+
+// Dependencies returns sorted relation dependencies for namespace#relation.
+func (m *CompiledModel) Dependencies(namespace, relation string) []string {
+	if m == nil {
+		return nil
+	}
+	return append([]string(nil), m.dependencies[namespace+"#"+relation]...)
+}
+
+// Dependents returns sorted relations that directly depend on namespace#relation.
+func (m *CompiledModel) Dependents(namespace, relation string) []string {
+	if m == nil {
+		return nil
+	}
+	return append([]string(nil), m.reverseDependencies[namespace+"#"+relation]...)
+}
+
+func collectRewriteDependencies(model AuthorizationModel, namespace string, rewrite Rewrite, set map[string]struct{}) {
+	if rewrite.ComputedUserset != "" {
+		set[namespace+"#"+rewrite.ComputedUserset] = struct{}{}
+	}
+	if rewrite.TupleToUserset != nil {
+		set[namespace+"#"+rewrite.TupleToUserset.Tupleset] = struct{}{}
+		for _, subject := range model.Namespaces[namespace].Relations[rewrite.TupleToUserset.Tupleset].AllowedSubjects {
+			if subject.Relation == "" {
+				set[subject.Namespace+"#"+rewrite.TupleToUserset.ComputedUserset] = struct{}{}
+			}
+		}
+	}
+	for _, child := range rewrite.Union {
+		collectRewriteDependencies(model, namespace, child, set)
+	}
+	for _, child := range rewrite.Intersection {
+		collectRewriteDependencies(model, namespace, child, set)
+	}
+	if rewrite.Exclusion != nil {
+		collectRewriteDependencies(model, namespace, rewrite.Exclusion.Base, set)
+		collectRewriteDependencies(model, namespace, rewrite.Exclusion.Subtract, set)
+	}
+}
+
+func sortedDependencyNames(dependencies map[string]struct{}) []string {
+	result := make([]string, 0, len(dependencies))
+	for name := range dependencies {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
 // Rewrite defines how a relation is derived. A zero Rewrite preserves the
 // original direct-tuple behavior (This).
 type Rewrite struct {
@@ -79,7 +192,78 @@ type Exclusion struct {
 // Validate checks model structure and its canonical namespace/relation names.
 func (m AuthorizationModel) Validate() error { return m.validate() }
 
+// LintModel returns deterministic, conservative diagnostics. Invalid models
+// are reported as one error; warnings never prevent activation.
+func LintModel(model AuthorizationModel) []ModelLintIssue {
+	if err := model.Validate(); err != nil {
+		return []ModelLintIssue{{Severity: LintError, Message: err.Error()}}
+	}
+	compiled, _ := CompileModel(model)
+	var issues []ModelLintIssue
+	for _, namespace := range sortedNamespaces(model.Namespaces) {
+		for _, relation := range sortedRelations(model.Namespaces[namespace].Relations) {
+			definition := model.Namespaces[namespace].Relations[relation]
+			path := namespace + "#" + relation
+			kind, _ := definition.Rewrite.kind()
+			if len(definition.AllowedSubjects) == 0 && !definition.AllowWildcard && kind == "this" {
+				issues = append(issues, ModelLintIssue{Severity: LintWarning, Path: path, Message: "relation has no subjects or rewrite and can never grant"})
+			}
+			if relationInCycle(path, compiled.dependencies) {
+				issues = append(issues, ModelLintIssue{Severity: LintWarning, Path: path, Message: "relation participates in a recursive dependency; evaluation is bounded and cycles deny"})
+			}
+		}
+	}
+	return issues
+}
+
+func sortedNamespaces(namespaces map[string]NamespaceDefinition) []string {
+	result := make([]string, 0, len(namespaces))
+	for name := range namespaces {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sortedRelations(relations map[string]RelationDefinition) []string {
+	result := make([]string, 0, len(relations))
+	for name := range relations {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func relationInCycle(start string, dependencies map[string][]string) bool {
+	visiting := make(map[string]bool)
+	var visit func(string) bool
+	visit = func(relation string) bool {
+		for _, dependency := range dependencies[relation] {
+			if dependency == start {
+				return true
+			}
+			if !visiting[dependency] {
+				visiting[dependency] = true
+				if visit(dependency) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	visiting[start] = true
+	return visit(start)
+}
+
+// ValidateTuple checks portable tuple syntax and whether the model permits its
+// resource relation, subject type, wildcard, and caveat.
+func (m AuthorizationModel) ValidateTuple(tuple RelationTuple) error { return m.validateTuple(tuple) }
+
 func (m AuthorizationModel) validate() error {
+	encoded, err := json.Marshal(m)
+	if err != nil || len(encoded) > maxModelSize {
+		return fmt.Errorf("%w: invalid or oversized model", ErrInvalidModel)
+	}
 	if len(m.Namespaces) == 0 {
 		return fmt.Errorf("%w: no namespaces", ErrInvalidModel)
 	}
@@ -112,6 +296,50 @@ func (m AuthorizationModel) validate() error {
 		}
 	}
 	return nil
+}
+
+func (m AuthorizationModel) compile() (AuthorizationModel, error) {
+	if err := m.validate(); err != nil {
+		return AuthorizationModel{}, err
+	}
+	compiled := AuthorizationModel{
+		Namespaces: make(map[string]NamespaceDefinition, len(m.Namespaces)),
+		Caveats:    make(map[string]CaveatDefinition, len(m.Caveats)),
+	}
+	for namespace, definition := range m.Namespaces {
+		relations := make(map[string]RelationDefinition, len(definition.Relations))
+		for name, relation := range definition.Relations {
+			relation.AllowedSubjects = append([]SubjectReference(nil), relation.AllowedSubjects...)
+			relation.Rewrite = cloneRewrite(relation.Rewrite)
+			relations[name] = relation
+		}
+		compiled.Namespaces[namespace] = NamespaceDefinition{Relations: relations}
+	}
+	for name, definition := range m.Caveats {
+		compiled.Caveats[name] = definition
+	}
+	return compiled, nil
+}
+
+func cloneRewrite(rewrite Rewrite) Rewrite {
+	clone := rewrite
+	clone.Union = make([]Rewrite, len(rewrite.Union))
+	for i, child := range rewrite.Union {
+		clone.Union[i] = cloneRewrite(child)
+	}
+	clone.Intersection = make([]Rewrite, len(rewrite.Intersection))
+	for i, child := range rewrite.Intersection {
+		clone.Intersection[i] = cloneRewrite(child)
+	}
+	if rewrite.TupleToUserset != nil {
+		value := *rewrite.TupleToUserset
+		clone.TupleToUserset = &value
+	}
+	if rewrite.Exclusion != nil {
+		value := Exclusion{Base: cloneRewrite(rewrite.Exclusion.Base), Subtract: cloneRewrite(rewrite.Exclusion.Subtract)}
+		clone.Exclusion = &value
+	}
+	return clone
 }
 
 func (m AuthorizationModel) validateRewrite(namespace string, rewrite Rewrite) error {
@@ -234,6 +462,11 @@ func (m AuthorizationModel) validateTuple(tuple RelationTuple) error {
 			return fmt.Errorf("%w: wildcard is not allowed on %s#%s", ErrInvalidTuple, tuple.Namespace, tuple.Relation)
 		}
 		return m.validateCaveat(tuple)
+	}
+	resource, _, _ := strings.Cut(tuple.User, "#")
+	_, subjectID, _ := strings.Cut(resource, ":")
+	if subjectID == "*" {
+		return fmt.Errorf("%w: wildcard subject %q is not supported", ErrInvalidTuple, tuple.User)
 	}
 
 	subject, err := m.subjectReference(tuple.User)

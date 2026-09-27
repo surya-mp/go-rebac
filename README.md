@@ -25,6 +25,8 @@ other graph-shaped authorization rules.
   model and tuple graph to one shared revision.
 - Pagination, batched reads, tuple watches, and deterministic
   application-defined caveats.
+- Privileged `Explain`, optional metrics/debug observers, a local diagnostics
+  CLI, and a bounded optional `/v1` HTTP adapter.
 
 ## Install
 
@@ -42,6 +44,13 @@ material for [modeling](docs/modeling.md), [storage implementations](docs/storag
 [content consistency](docs/consistency.md), [HTTP integration](docs/http.md),
 and [testing and operations](docs/operations.md).
 Release history is in [CHANGELOG.md](CHANGELOG.md).
+
+The local `rebac` CLI validates models and inspects the bundled KV store:
+
+```sh
+go run ./cmd/rebac model validate --file model.json
+go run ./cmd/rebac storage check --store rebac.json
+```
 
 ## Relationship tuple format
 
@@ -165,8 +174,9 @@ back to `CheckWithRevision` for a stable graph view. `Watch` streams committed
 tuple changes so an application-owned cache can invalidate tenant entries.
 
 The `Observer` interface is the integration point for tracing, metrics, and
-audit systems. `CheckEvent` includes the final reason, duration, graph-node
-count, and revision.
+audit systems. `CheckEvent` includes the final reason, model and tuple
+revisions, duration, graph-node count, storage calls, and tuples read; it
+never includes caveat context.
 
 ## Caveats and caching
 

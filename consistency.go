@@ -62,7 +62,8 @@ func (e *Engine) CheckWithConsistencyAt(ctx context.Context, minimum Consistency
 
 func (e *Engine) checkWithConsistency(ctx context.Context, minimum ConsistencyToken, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string) (allowed bool, token ConsistencyToken, err error) {
 	started := time.Now()
-	nodes := 0
+	evaluation := evaluationStats{}
+	var measured *memoReader
 	defer func() {
 		if e == nil || e.stats == nil {
 			return
@@ -76,19 +77,33 @@ func (e *Engine) checkWithConsistency(ctx context.Context, minimum ConsistencyTo
 			e.stats.errors.Add(1)
 		}
 		if e.observer != nil {
-			e.observer.ObserveCheck(ctx, CheckEvent{TenantID: tenantID, User: user, Relation: relation, Namespace: namespace, ObjectID: objectID, Revision: token.TupleRevision, Allowed: allowed, Reason: decisionReason(allowed, err), Err: err, Duration: time.Since(started), Nodes: nodes})
+			event := CheckEvent{TenantID: tenantID, User: user, Relation: relation, Namespace: namespace, ObjectID: objectID, Revision: token.TupleRevision, ModelID: token.ModelID, ModelVersion: token.ModelVersion, Allowed: allowed, Reason: decisionReason(allowed, err), Err: err, Duration: time.Since(started), Nodes: evaluation.nodes, MaxDepth: evaluation.maxDepth, Branches: evaluation.branches, Cycles: evaluation.cycles}
+			if measured != nil {
+				event.StorageCalls, event.TuplesRead, event.CacheHits = measured.calls, measured.tuples, measured.hits
+			}
+			e.observer.ObserveCheck(ctx, event)
 		}
 	}()
+	if err := validateCaveatContext(caveatContext); err != nil {
+		return false, ConsistencyToken{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if e != nil && e.maxEvaluationTime > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, e.maxEvaluationTime, ErrMaxEvaluationTime)
+		defer cancel()
+		defer func() { err = evaluationError(ctx, err) }()
+	}
 
 	view, reader, token, release, err := e.consistencyView(ctx, minimum, tenantID)
 	if err != nil {
 		return false, ConsistencyToken{}, err
 	}
+	measured, _ = reader.(*memoReader)
 	if err := view.model.validateCheck(user, relation, namespace, objectID); err != nil {
 		_ = release()
 		return false, ConsistencyToken{}, err
 	}
-	allowed, err = view.check(ctx, reader, caveatContext, tenantID, user, relation, namespace, objectID, make(map[checkKey]struct{}), 0, &nodes)
+	allowed, err = view.check(ctx, reader, caveatContext, tenantID, user, relation, namespace, objectID, make(map[checkKey]struct{}), 0, &evaluation)
 	if releaseErr := release(); err == nil && releaseErr != nil {
 		return false, ConsistencyToken{}, wrapStorageError(releaseErr)
 	}
@@ -188,7 +203,7 @@ func (e *Engine) LookupResourcesWithConsistency(ctx context.Context, minimum Con
 			continue
 		}
 		seen[objectID] = struct{}{}
-		ok, err := view.check(ctx, reader, withAsOf(request.CaveatContext, request.AsOfUnixNano), request.TenantID, request.User, request.Relation, request.Namespace, objectID, make(map[checkKey]struct{}), 0, new(int))
+		ok, err := view.check(ctx, reader, withAsOf(request.CaveatContext, request.AsOfUnixNano), request.TenantID, request.User, request.Relation, request.Namespace, objectID, make(map[checkKey]struct{}), 0, &evaluationStats{})
 		if err != nil {
 			return ResourcePage{}, ConsistencyToken{}, err
 		}
@@ -237,7 +252,7 @@ func (e *Engine) LookupSubjectsWithConsistency(ctx context.Context, minimum Cons
 			continue
 		}
 		seen[subject] = struct{}{}
-		ok, err := view.check(ctx, reader, withAsOf(request.CaveatContext, request.AsOfUnixNano), request.TenantID, subject, request.Relation, request.Namespace, request.ObjectID, make(map[checkKey]struct{}), 0, new(int))
+		ok, err := view.check(ctx, reader, withAsOf(request.CaveatContext, request.AsOfUnixNano), request.TenantID, subject, request.Relation, request.Namespace, request.ObjectID, make(map[checkKey]struct{}), 0, &evaluationStats{})
 		if err != nil {
 			return SubjectPage{}, ConsistencyToken{}, err
 		}
@@ -268,7 +283,7 @@ func (e *Engine) ExpandWithConsistencyAt(ctx context.Context, minimum Consistenc
 	if err := view.validateFilter(RelationTuple{Namespace: namespace, ObjectID: objectID, Relation: relation}); err != nil {
 		return Expansion{}, ConsistencyToken{}, err
 	}
-	expansion, err := view.expand(ctx, reader, withAsOf(nil, asOfUnixNano), tenantID, relation, namespace, objectID, make(map[checkKey]struct{}), 0)
+	expansion, err := view.expand(ctx, reader, withAsOf(nil, asOfUnixNano), tenantID, relation, namespace, objectID, token.TupleRevision, make(map[checkKey]struct{}), 0, new(int), new(int))
 	return expansion, token, err
 }
 
@@ -303,13 +318,15 @@ func (e *Engine) consistencyView(ctx context.Context, minimum ConsistencyToken, 
 		_ = release()
 		return nil, nil, ConsistencyToken{}, nil, ErrModelNotFound
 	}
-	model, err := document.Compile(e.caveats)
+	compiled, err := e.compiledModelForDocument(tenantID, document)
 	if err != nil {
 		_ = release()
 		return nil, nil, ConsistencyToken{}, nil, err
 	}
 	view := *e
-	view.model = model
-	reader = &memoReader{reader: reader, cache: make(map[tupleFilterKey][]RelationTuple)}
+	view.model = compiled.model
+	view.compiledModel = compiled
+	view.modelVersion = document.Version
+	reader = &memoReader{reader: reader, cache: make(map[tupleFilterKey][]RelationTuple), maxTuples: e.maxTuplesRead, maxCalls: e.maxStorageCalls}
 	return &view, reader, ConsistencyToken{TenantID: tenantID, ModelID: e.modelID, ModelVersion: document.Version, TupleRevision: revision}, release, nil
 }

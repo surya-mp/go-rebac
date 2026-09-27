@@ -1,13 +1,19 @@
 package rebac
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
 
-const maxNameLength = 63
+const (
+	maxNameLength        = 63
+	maxObjectIDLength    = 1024
+	maxModelSize         = 1 << 20
+	maxCaveatContextSize = 64 << 10
+)
 
 // Names in an authorization model use lower_snake_case. Keeping names
 // canonical makes tuples portable across storage implementations.
@@ -27,10 +33,21 @@ func validName(value string) bool {
 	return true
 }
 
+func validateCaveatContext(context CaveatContext) error {
+	if len(context) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(context)
+	if err != nil || len(encoded) > maxCaveatContextSize {
+		return fmt.Errorf("%w: invalid or oversized caveat context", ErrInvalidTuple)
+	}
+	return nil
+}
+
 // Object IDs are application-owned opaque strings. Separators and whitespace
 // are reserved so a subject always has one unambiguous wire representation.
 func validObjectID(value string) bool {
-	if value == "" || !utf8.ValidString(value) || strings.Contains(value, "#") {
+	if value == "" || len(value) > maxObjectIDLength || !utf8.ValidString(value) || strings.Contains(value, "#") {
 		return false
 	}
 	for _, r := range value {
@@ -50,6 +67,9 @@ func validateSubjectSyntax(subject string) error {
 	if !ok || !validName(namespace) || !validObjectID(objectID) {
 		return fmt.Errorf("%w: subjects must be namespace:objectID or namespace:objectID#relation", ErrInvalidTuple)
 	}
+	if objectID == "*" && subject != "user:*" {
+		return fmt.Errorf("%w: unsupported wildcard subject %q", ErrInvalidTuple, subject)
+	}
 	return nil
 }
 
@@ -67,6 +87,9 @@ func (t RelationTuple) ValidateSyntax() error {
 	}
 	if t.Caveat == "" && len(t.CaveatContext) != 0 {
 		return fmt.Errorf("%w: caveat context without a caveat", ErrInvalidTuple)
+	}
+	if err := validateCaveatContext(t.CaveatContext); err != nil {
+		return err
 	}
 	if t.Caveat != "" && !validName(t.Caveat) {
 		return fmt.Errorf("%w: invalid caveat %q", ErrInvalidTuple, t.Caveat)

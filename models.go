@@ -2,19 +2,91 @@ package rebac
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 )
 
-var ErrModelNotFound = errors.New("rebac: authorization model not found")
+type compiledModelKey struct {
+	tenantID, modelID, version, checksum string
+}
+
+type compiledModelCache struct {
+	mu     sync.RWMutex
+	models map[compiledModelKey]*CompiledModel
+}
+
+func (c *compiledModelCache) get(key compiledModelKey) *CompiledModel {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.models[key]
+}
+
+func (c *compiledModelCache) put(key compiledModelKey, model *CompiledModel) *CompiledModel {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cached := c.models[key]; cached != nil {
+		return cached
+	}
+	c.models[key] = model
+	return model
+}
+
+func (e *Engine) compiledModelForDocument(tenantID string, document ModelDocument) (*CompiledModel, error) {
+	checksum, err := document.ComputeChecksum()
+	if err != nil {
+		return nil, err
+	}
+	key := compiledModelKey{tenantID: tenantID, modelID: document.ID, version: string(document.Version), checksum: checksum}
+	if e.compiledModels != nil {
+		if cached := e.compiledModels.get(key); cached != nil {
+			return cached, nil
+		}
+	}
+	model, err := document.Compile(e.caveats)
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := CompileModel(model)
+	if err != nil {
+		return nil, err
+	}
+	if e.compiledModels == nil {
+		return compiled, nil
+	}
+	return e.compiledModels.put(key, compiled), nil
+}
+
+var (
+	ErrModelNotFound          = errors.New("rebac: authorization model not found")
+	ErrInvalidModelTransition = errors.New("rebac: incompatible authorization model transition")
+	ErrModelNotPublished      = errors.New("rebac: authorization model is not published")
+)
+
+// ModelState is the immutable lifecycle state recorded with one model version.
+type ModelState string
+
+const (
+	ModelDraft      ModelState = "draft"
+	ModelPublished  ModelState = "published"
+	ModelDeprecated ModelState = "deprecated"
+)
 
 // ModelDocument is the serializable, versioned form of an authorization
 // model. Caveat names are stored; their Go evaluators remain application code
 // and are bound with Compile after loading.
 type ModelDocument struct {
-	ID      string             `json:"id"`
-	Version Revision           `json:"version"`
-	Model   AuthorizationModel `json:"model"`
+	ID                string             `json:"id"`
+	Version           Revision           `json:"version"`
+	ParentVersion     Revision           `json:"parent_version,omitempty"`
+	CreatedAtUnixNano int64              `json:"created_at_unix_nano,omitempty"`
+	Checksum          string             `json:"checksum,omitempty"`
+	State             ModelState         `json:"state,omitempty"`
+	Model             AuthorizationModel `json:"model"`
 }
 
 // ModelSelection identifies the tenant-scoped model and optional historical
@@ -30,7 +102,88 @@ func (d ModelDocument) Validate() error {
 	if !validName(d.ID) {
 		return fmt.Errorf("%w: invalid model ID %q", ErrInvalidModel, d.ID)
 	}
-	return d.Model.Validate()
+	if d.State != "" && d.State != ModelDraft && d.State != ModelPublished && d.State != ModelDeprecated {
+		return fmt.Errorf("%w: invalid model state %q", ErrInvalidModel, d.State)
+	}
+	if err := d.Model.Validate(); err != nil {
+		return err
+	}
+	if d.Checksum != "" {
+		checksum, err := d.ComputeChecksum()
+		if err != nil {
+			return err
+		}
+		if d.Checksum != checksum {
+			return fmt.Errorf("%w: model checksum mismatch", ErrInvalidModel)
+		}
+	}
+	return nil
+}
+
+// ComputeChecksum returns the SHA-256 checksum of this document's stable model
+// content and immutable lifecycle state. Version and timestamps are excluded.
+func (d ModelDocument) ComputeChecksum() (string, error) {
+	payload := struct {
+		ID    string             `json:"id"`
+		State ModelState         `json:"state,omitempty"`
+		Model AuthorizationModel `json:"model"`
+	}{ID: d.ID, State: d.State, Model: d.Model}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ValidateModelTransition rejects changes that can invalidate live tuples or
+// alter an existing relation's meaning. Additive namespaces, relations,
+// subjects, and caveats are allowed.
+func ValidateModelTransition(old, next AuthorizationModel) error {
+	if err := old.Validate(); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	for namespace, oldDefinition := range old.Namespaces {
+		nextDefinition, ok := next.Namespaces[namespace]
+		if !ok {
+			return fmt.Errorf("%w: removed namespace %q", ErrInvalidModelTransition, namespace)
+		}
+		for relation, oldRelation := range oldDefinition.Relations {
+			nextRelation, ok := nextDefinition.Relations[relation]
+			if !ok {
+				return fmt.Errorf("%w: removed relation %s#%s", ErrInvalidModelTransition, namespace, relation)
+			}
+			if oldRelation.AllowWildcard && !nextRelation.AllowWildcard {
+				return fmt.Errorf("%w: disabled wildcard on %s#%s", ErrInvalidModelTransition, namespace, relation)
+			}
+			for _, subject := range oldRelation.AllowedSubjects {
+				if !containsSubject(nextRelation.AllowedSubjects, subject) {
+					return fmt.Errorf("%w: removed subject %s#%s from %s#%s", ErrInvalidModelTransition, subject.Namespace, subject.Relation, namespace, relation)
+				}
+			}
+			if !reflect.DeepEqual(oldRelation.Rewrite, nextRelation.Rewrite) {
+				return fmt.Errorf("%w: changed rewrite on %s#%s", ErrInvalidModelTransition, namespace, relation)
+			}
+		}
+	}
+	for name := range old.Caveats {
+		if _, ok := next.Caveats[name]; !ok {
+			return fmt.Errorf("%w: removed caveat %q", ErrInvalidModelTransition, name)
+		}
+	}
+	return nil
+}
+
+func containsSubject(subjects []SubjectReference, target SubjectReference) bool {
+	for _, subject := range subjects {
+		if subject == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Compile binds application-owned caveat evaluators to a loaded document.
@@ -57,6 +210,21 @@ func (d ModelDocument) Compile(caveats map[string]CaveatDefinition) (Authorizati
 type ModelStorage interface {
 	ReadAuthorizationModel(ctx context.Context, tenantID, modelID string, version Revision) (ModelDocument, error)
 	WriteAuthorizationModel(ctx context.Context, tenantID string, document ModelDocument, expected Revision) (ModelDocument, error)
+}
+
+// ModelVersionLister lists immutable versions in creation order. It is an
+// optional read capability; ModelStorage remains the portable baseline.
+type ModelVersionLister interface {
+	ListAuthorizationModelVersions(ctx context.Context, tenantID, modelID string) ([]ModelDocument, error)
+}
+
+// ActiveModelStorage atomically selects one immutable model version for a
+// tenant/model pair. expectedActive is the version currently active; empty
+// means that no version may be active yet.
+type ActiveModelStorage interface {
+	ModelStorage
+	ReadActiveAuthorizationModel(ctx context.Context, tenantID, modelID string) (ModelDocument, error)
+	ActivateAuthorizationModel(ctx context.Context, tenantID, modelID string, expectedActive, version Revision) (ModelDocument, Revision, error)
 }
 
 // ModelSnapshotStorage resolves the authorization model effective at a tuple
@@ -105,6 +273,12 @@ func NewEngineFromModelStorage(ctx context.Context, store StorageEngine, models 
 		return nil, ModelDocument{}, err
 	}
 	engine.modelTenant = selection.TenantID
+	engine.modelID = selection.ModelID
+	engine.modelVersion = document.Version
+	if checksum, err := document.ComputeChecksum(); err == nil && engine.compiledModels != nil {
+		key := compiledModelKey{tenantID: selection.TenantID, modelID: document.ID, version: string(document.Version), checksum: checksum}
+		engine.compiledModel = engine.compiledModels.put(key, engine.compiledModel)
+	}
 	return engine, document, nil
 }
 
