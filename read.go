@@ -15,76 +15,91 @@ const (
 // ReadTuplesRequest selects tuples from one tenant. Cursor is returned by a
 // previous call; callers should retain Revision for stable multi-page reads.
 type ReadTuplesRequest struct {
-	TenantID string
-	Filter   RelationTuple
-	Revision Revision
-	PageSize int
-	Cursor   string
+	TenantID string        `json:"tenant_id"`
+	Filter   RelationTuple `json:"filter"`
+	Revision Revision      `json:"revision,omitempty"`
+	PageSize int           `json:"page_size,omitempty"`
+	Cursor   string        `json:"cursor,omitempty"`
 }
 
 // TuplePage is one deterministic page of tuple results.
 type TuplePage struct {
-	Tuples     []RelationTuple
-	Revision   Revision
-	NextCursor string
+	Tuples     []RelationTuple `json:"tuples"`
+	Revision   Revision        `json:"revision,omitempty"`
+	NextCursor string          `json:"next_cursor,omitempty"`
 }
 
 // TupleBatch is one revision-consistent result set for independent filters.
 type TupleBatch struct {
-	Tuples   [][]RelationTuple
-	Revision Revision
+	Tuples   [][]RelationTuple `json:"tuples"`
+	Revision Revision          `json:"revision,omitempty"`
 }
 
 // LookupResourcesRequest asks which objects grant a subject one relation.
 type LookupResourcesRequest struct {
-	TenantID, User, Relation, Namespace string
-	Revision                            Revision
-	CaveatContext                       CaveatContext
-	PageSize                            int
-	Cursor                              string
+	TenantID      string        `json:"tenant_id"`
+	User          string        `json:"user"`
+	Relation      string        `json:"relation"`
+	Namespace     string        `json:"namespace"`
+	Revision      Revision      `json:"revision,omitempty"`
+	CaveatContext CaveatContext `json:"caveat_context,omitempty"`
+	AsOfUnixNano  int64         `json:"as_of_unix_nano,omitempty"`
+	PageSize      int           `json:"page_size,omitempty"`
+	Cursor        string        `json:"cursor,omitempty"`
 }
 
 // ResourcePage is one deterministic page of authorized object IDs.
 type ResourcePage struct {
-	ObjectIDs  []string
-	Revision   Revision
-	NextCursor string
+	ObjectIDs  []string `json:"object_ids"`
+	Revision   Revision `json:"revision,omitempty"`
+	NextCursor string   `json:"next_cursor,omitempty"`
 }
 
 // LookupSubjectsRequest asks which direct subjects of one namespace have a
 // relation on a resource.
 type LookupSubjectsRequest struct {
-	TenantID, Namespace, ObjectID, Relation, SubjectNamespace string
-	Revision                                                  Revision
-	CaveatContext                                             CaveatContext
-	PageSize                                                  int
-	Cursor                                                    string
+	TenantID         string        `json:"tenant_id"`
+	Namespace        string        `json:"namespace"`
+	ObjectID         string        `json:"object_id"`
+	Relation         string        `json:"relation"`
+	SubjectNamespace string        `json:"subject_namespace"`
+	Revision         Revision      `json:"revision,omitempty"`
+	CaveatContext    CaveatContext `json:"caveat_context,omitempty"`
+	AsOfUnixNano     int64         `json:"as_of_unix_nano,omitempty"`
+	PageSize         int           `json:"page_size,omitempty"`
+	Cursor           string        `json:"cursor,omitempty"`
 }
 
 // SubjectPage is one deterministic page of allowed direct subjects.
 type SubjectPage struct {
-	Subjects   []string
-	Revision   Revision
-	NextCursor string
+	Subjects   []string `json:"subjects"`
+	Revision   Revision `json:"revision,omitempty"`
+	NextCursor string   `json:"next_cursor,omitempty"`
 }
 
 // Expansion represents direct relationship edges and nested usersets for one
 // relation. Rewrite describes the model operation applied at this node.
 type Expansion struct {
-	Namespace, ObjectID, Relation string
-	Rewrite                       Rewrite
-	Tuples                        []RelationTuple
-	Children                      []Expansion
+	Namespace string          `json:"namespace"`
+	ObjectID  string          `json:"object_id"`
+	Relation  string          `json:"relation"`
+	Rewrite   Rewrite         `json:"rewrite"`
+	Tuples    []RelationTuple `json:"tuples"`
+	Children  []Expansion     `json:"children"`
 }
 
 // ReadTuples returns a page of model-valid tuples. It is intended for
 // administration and debugging; authorization decisions should use Check.
 func (e *Engine) ReadTuples(ctx context.Context, request ReadTuplesRequest) (TuplePage, error) {
+	if e != nil && e.modelSource != nil {
+		page, _, err := e.ReadTuplesWithConsistency(ctx, consistencyTokenForRevision(e, request.TenantID, request.Revision), request)
+		return page, err
+	}
 	if e == nil || e.store == nil {
 		return TuplePage{}, errors.New("rebac: storage engine is nil")
 	}
-	if request.TenantID == "" {
-		return TuplePage{}, ErrTenantRequired
+	if err := e.validateTenant(request.TenantID); err != nil {
+		return TuplePage{}, err
 	}
 	if err := e.validateFilter(request.Filter); err != nil {
 		return TuplePage{}, err
@@ -132,8 +147,8 @@ func (e *Engine) ReadTuplesBatch(ctx context.Context, tenantID string, revision 
 	if e == nil || e.store == nil {
 		return TupleBatch{}, errors.New("rebac: storage engine is nil")
 	}
-	if tenantID == "" {
-		return TupleBatch{}, ErrTenantRequired
+	if err := e.validateTenant(tenantID); err != nil {
+		return TupleBatch{}, err
 	}
 	for _, filter := range filters {
 		if err := e.validateFilter(filter); err != nil {
@@ -173,17 +188,43 @@ func (e *Engine) ReadTuplesBatch(ctx context.Context, tenantID string, revision 
 
 // LookupResources returns object IDs for which user is allowed relation.
 func (e *Engine) LookupResources(ctx context.Context, request LookupResourcesRequest) (ResourcePage, error) {
+	if e != nil && e.modelSource != nil {
+		page, _, err := e.LookupResourcesWithConsistency(ctx, consistencyTokenForRevision(e, request.TenantID, request.Revision), request)
+		return page, err
+	}
+	if e == nil || e.store == nil {
+		return ResourcePage{}, errors.New("rebac: storage engine is nil")
+	}
+	if err := e.validateTenant(request.TenantID); err != nil {
+		return ResourcePage{}, err
+	}
 	if err := e.model.validateCheck(request.User, request.Relation, request.Namespace, "lookup"); err != nil {
 		return ResourcePage{}, err
 	}
-	tuples, revision, err := e.readAllTuples(ctx, request.TenantID, request.Revision, RelationTuple{Namespace: request.Namespace})
-	if err != nil {
-		return ResourcePage{}, err
+	revision := request.Revision
+	var candidates []string
+	if indexed, ok := e.store.(ResourceCandidateReader); ok {
+		used, err := e.resolveRevision(ctx, request.Revision)
+		if err != nil {
+			return ResourcePage{}, err
+		}
+		revision = used
+		request.Revision = used
+		candidates, err = indexed.LookupResourceCandidates(ctx, request)
+		if err != nil {
+			return ResourcePage{}, wrapStorageError(err)
+		}
+	} else {
+		tuples, used, err := e.readAllTuples(ctx, request.TenantID, request.Revision, RelationTuple{Namespace: request.Namespace})
+		if err != nil {
+			return ResourcePage{}, err
+		}
+		revision = used
+		candidates = uniqueObjectIDs(tuples)
 	}
-	candidates := uniqueObjectIDs(tuples)
 	allowed := make([]string, 0, len(candidates))
 	for _, objectID := range candidates {
-		ok, _, err := e.CheckWithRevisionAndContext(ctx, revision, request.CaveatContext, request.TenantID, request.User, request.Relation, request.Namespace, objectID)
+		ok, _, err := e.CheckWithRevisionAt(ctx, revision, request.CaveatContext, request.AsOfUnixNano, request.TenantID, request.User, request.Relation, request.Namespace, objectID)
 		if err != nil {
 			return ResourcePage{}, err
 		}
@@ -196,26 +237,57 @@ func (e *Engine) LookupResources(ctx context.Context, request LookupResourcesReq
 
 // LookupSubjects returns direct subjects of SubjectNamespace with the relation.
 func (e *Engine) LookupSubjects(ctx context.Context, request LookupSubjectsRequest) (SubjectPage, error) {
+	if e != nil && e.modelSource != nil {
+		page, _, err := e.LookupSubjectsWithConsistency(ctx, consistencyTokenForRevision(e, request.TenantID, request.Revision), request)
+		return page, err
+	}
+	if e == nil || e.store == nil {
+		return SubjectPage{}, errors.New("rebac: storage engine is nil")
+	}
+	if err := e.validateTenant(request.TenantID); err != nil {
+		return SubjectPage{}, err
+	}
 	if request.SubjectNamespace == "" {
 		return SubjectPage{}, ErrInvalidRequest
 	}
 	if err := e.model.validateCheck(request.SubjectNamespace+":lookup", request.Relation, request.Namespace, request.ObjectID); err != nil {
 		return SubjectPage{}, err
 	}
-	tuples, revision, err := e.readAllTuples(ctx, request.TenantID, request.Revision, RelationTuple{})
-	if err != nil {
-		return SubjectPage{}, err
-	}
+	revision := request.Revision
 	candidates := make(map[string]struct{})
-	for _, tuple := range tuples {
-		namespace, _, ok := parseDirectSubject(tuple.User)
-		if ok && namespace == request.SubjectNamespace {
-			candidates[tuple.User] = struct{}{}
+	if indexed, ok := e.store.(SubjectCandidateReader); ok {
+		used, err := e.resolveRevision(ctx, request.Revision)
+		if err != nil {
+			return SubjectPage{}, err
+		}
+		revision = used
+		request.Revision = used
+		subjects, err := indexed.LookupSubjectCandidates(ctx, request)
+		if err != nil {
+			return SubjectPage{}, wrapStorageError(err)
+		}
+		for _, subject := range subjects {
+			namespace, _, direct := parseDirectSubject(subject)
+			if direct && namespace == request.SubjectNamespace {
+				candidates[subject] = struct{}{}
+			}
+		}
+	} else {
+		tuples, used, err := e.readAllTuples(ctx, request.TenantID, request.Revision, RelationTuple{})
+		if err != nil {
+			return SubjectPage{}, err
+		}
+		revision = used
+		for _, tuple := range tuples {
+			namespace, _, ok := parseDirectSubject(tuple.User)
+			if ok && namespace == request.SubjectNamespace {
+				candidates[tuple.User] = struct{}{}
+			}
 		}
 	}
 	subjects := make([]string, 0, len(candidates))
 	for subject := range candidates {
-		ok, _, err := e.CheckWithRevisionAndContext(ctx, revision, request.CaveatContext, request.TenantID, subject, request.Relation, request.Namespace, request.ObjectID)
+		ok, _, err := e.CheckWithRevisionAt(ctx, revision, request.CaveatContext, request.AsOfUnixNano, request.TenantID, subject, request.Relation, request.Namespace, request.ObjectID)
 		if err != nil {
 			return SubjectPage{}, err
 		}
@@ -232,8 +304,18 @@ func (e *Engine) LookupSubjects(ctx context.Context, request LookupSubjectsReque
 
 // Expand returns direct tuples and userset edges for one relation at revision.
 func (e *Engine) Expand(ctx context.Context, revision Revision, tenantID, relation, namespace, objectID string) (Expansion, Revision, error) {
-	if tenantID == "" {
-		return Expansion{}, "", ErrTenantRequired
+	return e.ExpandAt(ctx, revision, 0, tenantID, relation, namespace, objectID)
+}
+
+// ExpandAt returns the relationship tree at revision, excluding inactive
+// validity-window and caveated tuples.
+func (e *Engine) ExpandAt(ctx context.Context, revision Revision, asOfUnixNano int64, tenantID, relation, namespace, objectID string) (Expansion, Revision, error) {
+	if e != nil && e.modelSource != nil {
+		expansion, token, err := e.ExpandWithConsistencyAt(ctx, consistencyTokenForRevision(e, tenantID, revision), asOfUnixNano, tenantID, relation, namespace, objectID)
+		return expansion, token.TupleRevision, err
+	}
+	if err := e.validateTenant(tenantID); err != nil {
+		return Expansion{}, "", err
 	}
 	if err := e.validateFilter(RelationTuple{Namespace: namespace, ObjectID: objectID, Relation: relation}); err != nil {
 		return Expansion{}, "", err
@@ -243,11 +325,11 @@ func (e *Engine) Expand(ctx context.Context, revision Revision, tenantID, relati
 		return Expansion{}, "", err
 	}
 	defer release()
-	expansion, err := e.expand(ctx, reader, tenantID, relation, namespace, objectID, make(map[checkKey]struct{}), 0)
+	expansion, err := e.expand(ctx, reader, withAsOf(nil, asOfUnixNano), tenantID, relation, namespace, objectID, make(map[checkKey]struct{}), 0)
 	return expansion, used, err
 }
 
-func (e *Engine) expand(ctx context.Context, reader TupleReader, tenantID, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int) (Expansion, error) {
+func (e *Engine) expand(ctx context.Context, reader TupleReader, caveatContext CaveatContext, tenantID, relation, namespace, objectID string, visiting map[checkKey]struct{}, depth int) (Expansion, error) {
 	if depth > e.maxDepth {
 		return Expansion{}, ErrMaxDepthExceeded
 	}
@@ -262,13 +344,24 @@ func (e *Engine) expand(ctx context.Context, reader TupleReader, tenantID, relat
 	if err != nil {
 		return Expansion{}, err
 	}
+	active := tuples[:0]
+	for _, tuple := range tuples {
+		applies, err := e.evaluateCaveat(ctx, tuple, caveatContext)
+		if err != nil {
+			return Expansion{}, err
+		}
+		if applies {
+			active = append(active, tuple)
+		}
+	}
+	tuples = active
 	expansion := Expansion{Namespace: namespace, ObjectID: objectID, Relation: relation, Rewrite: e.model.Namespaces[namespace].Relations[relation].Rewrite, Tuples: tuples}
 	for _, tuple := range tuples {
 		childNamespace, childObjectID, childRelation, ok := parseUserset(tuple.User)
 		if !ok {
 			continue
 		}
-		child, err := e.expand(ctx, reader, tenantID, childRelation, childNamespace, childObjectID, visiting, depth+1)
+		child, err := e.expand(ctx, reader, caveatContext, tenantID, childRelation, childNamespace, childObjectID, visiting, depth+1)
 		if err != nil {
 			return Expansion{}, err
 		}
@@ -302,6 +395,17 @@ func (e *Engine) readAllTuples(ctx context.Context, tenantID string, revision Re
 	defer release()
 	tuples, err := e.queryTuples(ctx, reader, tenantID, filter)
 	return tuples, used, err
+}
+
+func (e *Engine) resolveRevision(ctx context.Context, requested Revision) (Revision, error) {
+	_, used, release, err := e.readView(ctx, requested)
+	if err != nil {
+		return "", err
+	}
+	if err := release(); err != nil {
+		return "", wrapStorageError(err)
+	}
+	return used, nil
 }
 
 func (e *Engine) validateFilter(filter RelationTuple) error {
@@ -398,4 +502,11 @@ func pageBounds(size int, cursor string) (int, int, error) {
 func withTenant(tenantID string, filter RelationTuple) RelationTuple {
 	filter.TenantID = tenantID
 	return filter
+}
+
+func consistencyTokenForRevision(e *Engine, tenantID string, revision Revision) ConsistencyToken {
+	if revision == "" {
+		return ConsistencyToken{}
+	}
+	return ConsistencyToken{TenantID: tenantID, ModelID: e.modelID, TupleRevision: revision}
 }

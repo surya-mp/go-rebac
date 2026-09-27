@@ -15,8 +15,8 @@ var (
 // AuthorizationModel declares the object types and relationships an
 // application permits. Pass it to NewEngine at application startup.
 type AuthorizationModel struct {
-	Namespaces map[string]NamespaceDefinition
-	Caveats    map[string]CaveatDefinition
+	Namespaces map[string]NamespaceDefinition `json:"namespaces"`
+	Caveats    map[string]CaveatDefinition    `json:"caveats,omitempty"`
 }
 
 // CaveatContext carries tuple parameters and request values into an
@@ -29,66 +29,70 @@ type CaveatEvaluator func(context.Context, CaveatContext, CaveatContext) (bool, 
 
 // CaveatDefinition is owned by the application alongside its model.
 type CaveatDefinition struct {
-	Evaluate CaveatEvaluator
+	Evaluate CaveatEvaluator `json:"-"`
 }
 
 // NamespaceDefinition declares relations available on one object type. A
 // namespace such as "user" may have no relations and only represent subjects.
 type NamespaceDefinition struct {
-	Relations map[string]RelationDefinition
+	Relations map[string]RelationDefinition `json:"relations"`
 }
 
 // RelationDefinition lists the subject types allowed in a relation.
 type RelationDefinition struct {
-	AllowedSubjects []SubjectReference
-	Rewrite         Rewrite
+	AllowedSubjects []SubjectReference `json:"allowed_subjects,omitempty"`
+	AllowWildcard   bool               `json:"allow_wildcard,omitempty"`
+	Rewrite         Rewrite            `json:"rewrite,omitempty"`
 }
 
 // SubjectReference names a direct subject type (Relation empty), or a userset
 // such as group#member.
 type SubjectReference struct {
-	Namespace string
-	Relation  string
+	Namespace string `json:"namespace"`
+	Relation  string `json:"relation,omitempty"`
 }
 
 // Rewrite defines how a relation is derived. A zero Rewrite preserves the
 // original direct-tuple behavior (This).
 type Rewrite struct {
-	This            bool
-	ComputedUserset string
-	TupleToUserset  *TupleToUserset
-	Union           []Rewrite
-	Intersection    []Rewrite
-	Exclusion       *Exclusion
+	This            bool            `json:"this,omitempty"`
+	ComputedUserset string          `json:"computed_userset,omitempty"`
+	TupleToUserset  *TupleToUserset `json:"tuple_to_userset,omitempty"`
+	Union           []Rewrite       `json:"union,omitempty"`
+	Intersection    []Rewrite       `json:"intersection,omitempty"`
+	Exclusion       *Exclusion      `json:"exclusion,omitempty"`
 }
 
 // TupleToUserset follows Tupleset on the current object, then evaluates
 // ComputedUserset on each referenced object.
 type TupleToUserset struct {
-	Tupleset        string
-	ComputedUserset string
+	Tupleset        string `json:"tupleset"`
+	ComputedUserset string `json:"computed_userset"`
 }
 
 // Exclusion grants Base unless Subtract also grants access.
 type Exclusion struct {
-	Base     Rewrite
-	Subtract Rewrite
+	Base     Rewrite `json:"base"`
+	Subtract Rewrite `json:"subtract"`
 }
+
+// Validate checks model structure and its canonical namespace/relation names.
+func (m AuthorizationModel) Validate() error { return m.validate() }
 
 func (m AuthorizationModel) validate() error {
 	if len(m.Namespaces) == 0 {
 		return fmt.Errorf("%w: no namespaces", ErrInvalidModel)
 	}
 	for namespace, definition := range m.Namespaces {
-		if namespace == "" {
-			return fmt.Errorf("%w: empty namespace", ErrInvalidModel)
+		if !validName(namespace) {
+			return fmt.Errorf("%w: invalid namespace %q", ErrInvalidModel, namespace)
 		}
 		for relation, definition := range definition.Relations {
-			if relation == "" {
-				return fmt.Errorf("%w: empty relation in %q", ErrInvalidModel, namespace)
+			if !validName(relation) {
+				return fmt.Errorf("%w: invalid relation %q in %q", ErrInvalidModel, relation, namespace)
 			}
 			for _, subject := range definition.AllowedSubjects {
-				if _, ok := m.Namespaces[subject.Namespace]; subject.Namespace == "" || !ok {
+				if _, ok := m.Namespaces[subject.Namespace]; !validName(subject.Namespace) || !ok {
 					return fmt.Errorf("%w: unknown subject namespace %q", ErrInvalidModel, subject.Namespace)
 				}
 				if subject.Relation != "" {
@@ -100,6 +104,11 @@ func (m AuthorizationModel) validate() error {
 			if err := m.validateRewrite(namespace, definition.Rewrite); err != nil {
 				return err
 			}
+		}
+	}
+	for name := range m.Caveats {
+		if !validName(name) {
+			return fmt.Errorf("%w: invalid caveat %q", ErrInvalidModel, name)
 		}
 	}
 	return nil
@@ -209,6 +218,9 @@ func (r Rewrite) kind() (string, error) {
 }
 
 func (m AuthorizationModel) validateTuple(tuple RelationTuple) error {
+	if err := tuple.ValidateSyntax(); err != nil {
+		return err
+	}
 	definition, ok := m.Namespaces[tuple.Namespace]
 	if tuple.Namespace == "" || !ok {
 		return fmt.Errorf("%w: unknown namespace %q", ErrInvalidTuple, tuple.Namespace)
@@ -216,6 +228,12 @@ func (m AuthorizationModel) validateTuple(tuple RelationTuple) error {
 	relation, ok := definition.Relations[tuple.Relation]
 	if tuple.ObjectID == "" || tuple.Relation == "" || !ok {
 		return fmt.Errorf("%w: unknown or empty relation %q", ErrInvalidTuple, tuple.Relation)
+	}
+	if tuple.User == "user:*" {
+		if !relation.AllowWildcard {
+			return fmt.Errorf("%w: wildcard is not allowed on %s#%s", ErrInvalidTuple, tuple.Namespace, tuple.Relation)
+		}
+		return m.validateCaveat(tuple)
 	}
 
 	subject, err := m.subjectReference(tuple.User)
@@ -232,9 +250,6 @@ func (m AuthorizationModel) validateTuple(tuple RelationTuple) error {
 
 func (m AuthorizationModel) validateCaveat(tuple RelationTuple) error {
 	if tuple.Caveat == "" {
-		if len(tuple.CaveatContext) != 0 {
-			return fmt.Errorf("%w: caveat context without a caveat", ErrInvalidTuple)
-		}
 		return nil
 	}
 	definition, ok := m.Caveats[tuple.Caveat]
@@ -245,20 +260,26 @@ func (m AuthorizationModel) validateCaveat(tuple RelationTuple) error {
 }
 
 func (m AuthorizationModel) validateCheck(user, relation, namespace, objectID string) error {
-	if objectID == "" {
+	if !validObjectID(objectID) {
 		return fmt.Errorf("%w: empty object ID", ErrInvalidTuple)
 	}
-	if _, ok := m.Namespaces[namespace]; namespace == "" || !ok {
+	if _, ok := m.Namespaces[namespace]; !validName(namespace) || !ok {
 		return fmt.Errorf("%w: unknown namespace %q", ErrInvalidTuple, namespace)
 	}
-	if _, ok := m.Namespaces[namespace].Relations[relation]; relation == "" || !ok {
+	if _, ok := m.Namespaces[namespace].Relations[relation]; !validName(relation) || !ok {
 		return fmt.Errorf("%w: unknown relation %q", ErrInvalidTuple, relation)
+	}
+	if user == "user:*" {
+		return fmt.Errorf("%w: wildcard is not a valid check subject", ErrInvalidTuple)
 	}
 	_, err := m.subjectReference(user)
 	return err
 }
 
 func (m AuthorizationModel) subjectReference(user string) (SubjectReference, error) {
+	if err := validateSubjectSyntax(user); err != nil {
+		return SubjectReference{}, err
+	}
 	if strings.Contains(user, "#") {
 		namespace, _, relation, ok := parseUserset(user)
 		if !ok {

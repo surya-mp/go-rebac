@@ -15,12 +15,18 @@
 // membership.
 //
 // Engine is safe for concurrent checks. StorageEngine implementations own
-// connection management and durability. The PostgreSQL adapter accepts an
-// application-owned *sql.DB; it never opens or closes a database connection.
-// PostgreSQL schemas are versioned in migrations/.
+// connection management, durability, and database-driver selection. The core
+// package never opens or closes a database connection.
 //
 // For stable decisions across calls, use CheckWithRevision and pass the
 // returned Revision into later reads. Storage implementations that support
 // revisions also provide atomic tuple mutations and change watches for
 // application-owned cache invalidation.
+//
+// ModelDocument and ModelStorage provide optional, versioned serialization of
+// application models. NewProductionEngine makes revision consistency, atomic
+// mutations, and indexed lookups explicit for production storage. Storage
+// authors can use the conformance package to exercise the portable contract.
+// NewConsistentEngineFromModelStorage adds an optional Zanzibar-style protocol
+// that evaluates a model and tuple graph from one at-least-as-fresh revision.
 package rebac

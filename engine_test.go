@@ -141,6 +141,68 @@ func TestCheckStopsAtLimit(t *testing.T) {
 	}
 }
 
+func TestCheckAtValidityIntervalAndWildcard(t *testing.T) {
+	model := testModel()
+	document := model.Namespaces["document"]
+	viewer := document.Relations["viewer"]
+	viewer.AllowWildcard = true
+	document.Relations["viewer"] = viewer
+	model.Namespaces["document"] = document
+	store := &snapshotMemoryStore{}
+	engine, err := NewEngine(store, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := engine.WriteTuple(ctx, RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "window", Relation: "viewer", User: "user:alice", NotBeforeUnixNano: 100, NotAfterUnixNano: 200}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := engine.Check(ctx, "acme", "user:alice", "viewer", "document", "window"); err != nil || allowed {
+		t.Fatalf("Check() = %v, %v; want false, nil", allowed, err)
+	}
+	for _, test := range []struct {
+		at   int64
+		want bool
+	}{{99, false}, {100, true}, {199, true}, {200, false}} {
+		allowed, err := engine.CheckAt(ctx, test.at, "acme", "user:alice", "viewer", "document", "window")
+		if err != nil || allowed != test.want {
+			t.Fatalf("CheckAt(%d) = %v, %v; want %v, nil", test.at, allowed, err, test.want)
+		}
+	}
+	for _, test := range []struct {
+		at   int64
+		want int
+	}{{99, 0}, {100, 1}} {
+		page, err := engine.LookupResources(ctx, LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document", AsOfUnixNano: test.at})
+		if err != nil || len(page.ObjectIDs) != test.want {
+			t.Fatalf("LookupResources(%d) = %#v, %v; want %d objects, nil", test.at, page, err, test.want)
+		}
+	}
+	expansion, _, err := engine.ExpandAt(ctx, "", 100, "acme", "viewer", "document", "window")
+	if err != nil || len(expansion.Tuples) != 1 {
+		t.Fatalf("ExpandAt() = %#v, %v; want one active tuple, nil", expansion, err)
+	}
+	if err := engine.WriteTuple(ctx, RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "public", Relation: "viewer", User: "user:*"}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := engine.Check(ctx, "acme", "user:bob", "viewer", "document", "public"); err != nil || !allowed {
+		t.Fatalf("wildcard Check() = %v, %v; want true, nil", allowed, err)
+	}
+}
+
+func TestDeleteObjectRemovesAllRelations(t *testing.T) {
+	store := &revisionMemoryStore{revision: "42", memoryStore: memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "roadmap", Relation: "viewer", User: "user:alice"},
+	}}
+	engine, err := NewEngine(store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.DeleteObject(context.Background(), "acme", "document", "roadmap"); !errors.Is(err, ErrMutationUnsupported) {
+		t.Fatalf("DeleteObject() error = %v; want ErrMutationUnsupported", err)
+	}
+}
+
 type revisionMemoryStore struct {
 	memoryStore
 	revision Revision
@@ -396,5 +458,117 @@ func TestWatch(t *testing.T) {
 	}
 	if err, ok := <-errorsCh; ok || err != nil {
 		t.Fatalf("Watch error = %v, open=%v", err, ok)
+	}
+}
+
+type indexedMemoryStore struct {
+	*revisionMemoryStore
+	resources, subjects []string
+	indexedAt           Revision
+}
+
+func (s *indexedMemoryStore) SnapshotAtLeast(ctx context.Context, minimum Revision) (TupleReader, Revision, func() error, error) {
+	if minimum != "" && minimum != "41" && minimum != s.revision {
+		return nil, "", nil, ErrInvalidRevision
+	}
+	return s.SnapshotAt(ctx, "")
+}
+
+func (s *indexedMemoryStore) LookupResourceCandidatesAt(ctx context.Context, snapshot Revision, request LookupResourcesRequest) ([]string, Revision, error) {
+	candidates, err := s.LookupResourceCandidates(ctx, request)
+	if s.indexedAt != "" {
+		return candidates, s.indexedAt, err
+	}
+	return candidates, snapshot, err
+}
+
+func (s *indexedMemoryStore) LookupSubjectCandidatesAt(ctx context.Context, snapshot Revision, request LookupSubjectsRequest) ([]string, Revision, error) {
+	candidates, err := s.LookupSubjectCandidates(ctx, request)
+	if s.indexedAt != "" {
+		return candidates, s.indexedAt, err
+	}
+	return candidates, snapshot, err
+}
+
+func (s *indexedMemoryStore) WatchTuples(ctx context.Context, request WatchRequest) (<-chan WatchEvent, <-chan error) {
+	return s.Watch(ctx, request.TenantID, request.After)
+}
+
+func (s *indexedMemoryStore) LookupResourceCandidates(_ context.Context, _ LookupResourcesRequest) ([]string, error) {
+	return s.resources, nil
+}
+
+func (s *indexedMemoryStore) LookupSubjectCandidates(_ context.Context, _ LookupSubjectsRequest) ([]string, error) {
+	return s.subjects, nil
+}
+
+func TestLookupUsesIndexedCandidates(t *testing.T) {
+	store := &indexedMemoryStore{
+		revisionMemoryStore: &revisionMemoryStore{
+			memoryStore: memoryStore{
+				{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"},
+				{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "group:eng#member"},
+				{TenantID: "acme", Namespace: "group", ObjectID: "eng", Relation: "member", User: "user:bob"},
+			},
+			revision: "42",
+		},
+		resources: []string{"plan"},
+		subjects:  []string{"user:alice", "user:bob"},
+	}
+	engine, err := NewEngine(store, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := engine.LookupResources(context.Background(), LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document"})
+	if err != nil || !reflect.DeepEqual(resources.ObjectIDs, []string{"plan"}) {
+		t.Fatalf("LookupResources() = %#v, %v", resources, err)
+	}
+	subjects, err := engine.LookupSubjects(context.Background(), LookupSubjectsRequest{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", SubjectNamespace: "user"})
+	if err != nil || !reflect.DeepEqual(subjects.Subjects, []string{"user:alice", "user:bob"}) {
+		t.Fatalf("LookupSubjects() = %#v, %v", subjects, err)
+	}
+}
+
+func TestConsistentEnginePinsModelAndTupleSnapshots(t *testing.T) {
+	store := &indexedMemoryStore{
+		revisionMemoryStore: &revisionMemoryStore{
+			memoryStore: memoryStore{{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}},
+			revision:    "42",
+		},
+		resources: []string{"plan"},
+		subjects:  []string{"user:alice"},
+	}
+	models := staticModelStorage{document: ModelDocument{ID: "document_access", Version: "7", Model: testModel()}}
+	engine, _, err := NewConsistentEngineFromModelStorage(context.Background(), store, models, ModelSelection{TenantID: "acme", ModelID: "document_access"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, token, err := engine.ContentChangeCheck(context.Background(), ContentChangeCheckRequest{
+		TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document", ObjectID: "plan",
+	})
+	if err != nil || !allowed || token.TupleRevision != "42" || token.ModelVersion != "7" {
+		t.Fatalf("ContentChangeCheck() = %v, %#v, %v", allowed, token, err)
+	}
+	allowed, token, err = engine.CheckWithConsistency(context.Background(), token, "acme", "user:alice", "viewer", "document", "plan")
+	if err != nil || !allowed || token.TupleRevision != "42" {
+		t.Fatalf("CheckWithConsistency() = %v, %#v, %v", allowed, token, err)
+	}
+	resources, _, err := engine.LookupResourcesWithConsistency(context.Background(), token, LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document"})
+	if err != nil || !reflect.DeepEqual(resources.ObjectIDs, []string{"plan"}) {
+		t.Fatalf("LookupResourcesWithConsistency() = %#v, %v", resources, err)
+	}
+	events, watchErrors := engine.WatchWithConsistency(context.Background(), token, "acme", nil)
+	if event, ok := <-events; !ok || event.Revision != "42" {
+		t.Fatalf("WatchWithConsistency event = %#v, open=%v", event, ok)
+	}
+	if err, ok := <-watchErrors; ok || err != nil {
+		t.Fatalf("WatchWithConsistency error = %v, open=%v", err, ok)
+	}
+	if _, _, err := engine.CheckWithConsistency(context.Background(), ConsistencyToken{TenantID: "other", ModelID: "document_access", TupleRevision: "42"}, "acme", "user:alice", "viewer", "document", "plan"); !errors.Is(err, ErrInvalidRevision) {
+		t.Fatalf("cross-tenant token error = %v; want ErrInvalidRevision", err)
+	}
+	store.indexedAt = "41"
+	if _, _, err := engine.LookupResourcesWithConsistency(context.Background(), token, LookupResourcesRequest{TenantID: "acme", User: "user:alice", Relation: "viewer", Namespace: "document"}); !errors.Is(err, ErrIndexSnapshot) {
+		t.Fatalf("stale lookup index error = %v; want ErrIndexSnapshot", err)
 	}
 }

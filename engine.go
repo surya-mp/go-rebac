@@ -12,6 +12,7 @@ var (
 	ErrMaxDepthExceeded = errors.New("rebac: maximum graph depth exceeded")
 	ErrMaxNodesExceeded = errors.New("rebac: maximum graph nodes exceeded")
 	ErrTenantRequired   = errors.New("rebac: tenant ID is required")
+	ErrModelTenant      = errors.New("rebac: selected model belongs to another tenant")
 	ErrInvalidRequest   = errors.New("rebac: invalid request")
 	ErrStorage          = errors.New("rebac: storage error")
 )
@@ -19,17 +20,23 @@ var (
 const (
 	defaultMaxDepth = 50
 	defaultMaxNodes = 10_000
+	asOfContextKey  = "_rebac_as_of_unix_nano"
 )
 
 // Engine evaluates tuples supplied by its storage backend.
 type Engine struct {
-	store    StorageEngine
-	model    AuthorizationModel
-	maxDepth int
-	maxNodes int
-	observer Observer
-	stats    *engineStats
-	cache    DecisionCache
+	store       StorageEngine
+	model       AuthorizationModel
+	maxDepth    int
+	maxNodes    int
+	observer    Observer
+	stats       *engineStats
+	cache       DecisionCache
+	modelTenant string
+	modelID     string
+	modelSource ModelSnapshotStorage
+	caveats     map[string]CaveatDefinition
+	coalescer   *checkCoalescer
 }
 
 // NewEngine compiles the application-owned authorization model and uses store
@@ -42,6 +49,15 @@ func NewEngine(store StorageEngine, model AuthorizationModel) (*Engine, error) {
 		return nil, err
 	}
 	return newEngine(store, model, defaultMaxDepth, defaultMaxNodes), nil
+}
+
+// NewProductionEngine constructs an Engine only for storage adapters that
+// provide revision consistency, atomic mutations, and indexed lookup support.
+func NewProductionEngine(store ProductionStorage, model AuthorizationModel) (*Engine, error) {
+	if store == nil {
+		return nil, ErrProductionStorage
+	}
+	return NewEngine(store, model)
 }
 
 // WithLimits returns a copy with explicit evaluation ceilings. Both values
@@ -86,14 +102,57 @@ func newEngine(store StorageEngine, model AuthorizationModel, maxDepth, maxNodes
 
 // Check reports whether user has relation on namespace:objectID within tenantID.
 func (e *Engine) Check(ctx context.Context, tenantID, user, relation, namespace, objectID string) (bool, error) {
+	if e != nil && e.coalescer != nil {
+		return e.coalescer.do(ctx, checkFlightKey(tenantID, user, relation, namespace, objectID), func() (bool, error) {
+			return e.checkUncoalesced(ctx, tenantID, user, relation, namespace, objectID)
+		})
+	}
+	return e.checkUncoalesced(ctx, tenantID, user, relation, namespace, objectID)
+}
+
+func (e *Engine) checkUncoalesced(ctx context.Context, tenantID, user, relation, namespace, objectID string) (bool, error) {
+	if e != nil && e.modelSource != nil {
+		allowed, _, err := e.CheckWithConsistency(ctx, ConsistencyToken{}, tenantID, user, relation, namespace, objectID)
+		return allowed, err
+	}
 	allowed, _, err := e.CheckWithRevision(ctx, "", tenantID, user, relation, namespace, objectID)
 	return allowed, err
 }
 
 // CheckWithContext evaluates tuple caveats against caveatContext.
 func (e *Engine) CheckWithContext(ctx context.Context, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string) (bool, error) {
+	if e != nil && e.modelSource != nil {
+		allowed, _, err := e.CheckWithConsistencyAndContext(ctx, ConsistencyToken{}, caveatContext, tenantID, user, relation, namespace, objectID)
+		return allowed, err
+	}
 	allowed, _, err := e.CheckWithRevisionAndContext(ctx, "", caveatContext, tenantID, user, relation, namespace, objectID)
 	return allowed, err
+}
+
+// CheckAt evaluates access at asOfUnixNano. A tuple with a validity interval is
+// inactive unless this value falls within its half-open interval. Zero denies
+// interval-bearing tuples, so ordinary Check calls remain fail-closed.
+func (e *Engine) CheckAt(ctx context.Context, asOfUnixNano int64, tenantID, user, relation, namespace, objectID string) (bool, error) {
+	return e.CheckWithContextAt(ctx, nil, asOfUnixNano, tenantID, user, relation, namespace, objectID)
+}
+
+// CheckWithContextAt evaluates caveats and tuple validity intervals together.
+func (e *Engine) CheckWithContextAt(ctx context.Context, caveatContext CaveatContext, asOfUnixNano int64, tenantID, user, relation, namespace, objectID string) (bool, error) {
+	return e.CheckWithContext(ctx, withAsOf(caveatContext, asOfUnixNano), tenantID, user, relation, namespace, objectID)
+}
+
+// CheckWithRevisionAt evaluates one revision with a fixed tuple-validity time.
+func (e *Engine) CheckWithRevisionAt(ctx context.Context, revision Revision, caveatContext CaveatContext, asOfUnixNano int64, tenantID, user, relation, namespace, objectID string) (bool, Revision, error) {
+	return e.CheckWithRevisionAndContext(ctx, revision, withAsOf(caveatContext, asOfUnixNano), tenantID, user, relation, namespace, objectID)
+}
+
+func withAsOf(caveatContext CaveatContext, asOfUnixNano int64) CaveatContext {
+	contextAt := make(CaveatContext, len(caveatContext)+1)
+	for key, value := range caveatContext {
+		contextAt[key] = value
+	}
+	contextAt[asOfContextKey] = asOfUnixNano
+	return contextAt
 }
 
 // CheckWithRevision evaluates at revision, or at the latest consistent view
@@ -104,6 +163,13 @@ func (e *Engine) CheckWithRevision(ctx context.Context, revision Revision, tenan
 
 // CheckWithRevisionAndContext evaluates a stable graph view and caveats.
 func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revision, caveatContext CaveatContext, tenantID, user, relation, namespace, objectID string) (allowed bool, used Revision, err error) {
+	if e != nil && e.modelSource != nil {
+		if revision != "" {
+			return false, "", ErrConsistencyUnsupported
+		}
+		allowed, token, err := e.CheckWithConsistencyAndContext(ctx, ConsistencyToken{}, caveatContext, tenantID, user, relation, namespace, objectID)
+		return allowed, token.TupleRevision, err
+	}
 	started := time.Now()
 	nodes := 0
 	defer func() {
@@ -126,8 +192,8 @@ func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revis
 	if e == nil || e.store == nil {
 		return false, "", errors.New("rebac: storage engine is nil")
 	}
-	if tenantID == "" {
-		return false, "", ErrTenantRequired
+	if err := e.validateTenant(tenantID); err != nil {
+		return false, "", err
 	}
 	if err := e.model.validateCheck(user, relation, namespace, objectID); err != nil {
 		return false, "", err
@@ -197,8 +263,8 @@ func (e *Engine) WriteTupleWithRevision(ctx context.Context, tuple RelationTuple
 	if e == nil || e.store == nil {
 		return "", errors.New("rebac: storage engine is nil")
 	}
-	if tuple.TenantID == "" {
-		return "", ErrTenantRequired
+	if err := e.validateTenant(tuple.TenantID); err != nil {
+		return "", err
 	}
 	if err := e.model.validateTuple(tuple); err != nil {
 		return "", err
@@ -228,8 +294,8 @@ func (e *Engine) DeleteTupleWithRevision(ctx context.Context, tuple RelationTupl
 	if e == nil || e.store == nil {
 		return "", errors.New("rebac: storage engine is nil")
 	}
-	if tuple.TenantID == "" {
-		return "", ErrTenantRequired
+	if err := e.validateTenant(tuple.TenantID); err != nil {
+		return "", err
 	}
 	if err := e.model.validateTuple(tuple); err != nil {
 		return "", err
@@ -245,6 +311,30 @@ func (e *Engine) DeleteTupleWithRevision(ctx context.Context, tuple RelationTupl
 	}
 	e.observeMutation(ctx, "", 1, nil)
 	return "", nil
+}
+
+// DeleteObject removes every relationship defined on namespace:objectID.
+// Relationships that point at the object are left as inert references; they no
+// longer grant because the deleted object's usersets are empty.
+func (e *Engine) DeleteObject(ctx context.Context, tenantID, namespace, objectID string) (Revision, error) {
+	if e == nil || e.store == nil {
+		return "", errors.New("rebac: storage engine is nil")
+	}
+	if err := e.validateTenant(tenantID); err != nil {
+		return "", err
+	}
+	if !validName(namespace) || !validObjectID(objectID) {
+		return "", ErrInvalidTuple
+	}
+	if _, ok := e.model.Namespaces[namespace]; !ok {
+		return "", ErrInvalidTuple
+	}
+	if storage, ok := e.store.(ObjectDeletionStorage); ok {
+		revision, err := storage.DeleteObject(ctx, tenantID, namespace, objectID)
+		e.observeMutation(ctx, revision, 0, err)
+		return revision, wrapStorageError(err)
+	}
+	return "", ErrMutationUnsupported
 }
 
 // Mutate validates and atomically applies changes when the storage supports
@@ -279,10 +369,20 @@ func (e *Engine) Mutate(ctx context.Context, changes []TupleChange, precondition
 }
 
 func (e *Engine) validateMutationTuple(tuple RelationTuple) error {
-	if tuple.TenantID == "" {
-		return ErrTenantRequired
+	if err := e.validateTenant(tuple.TenantID); err != nil {
+		return err
 	}
 	return e.model.validateTuple(tuple)
+}
+
+func (e *Engine) validateTenant(tenantID string) error {
+	if !validObjectID(tenantID) {
+		return ErrTenantRequired
+	}
+	if e.modelTenant != "" && e.modelTenant != tenantID {
+		return ErrModelTenant
+	}
+	return nil
 }
 
 // Watch streams committed changes for one tenant after revision. Cache users
@@ -296,8 +396,8 @@ func (e *Engine) Watch(ctx context.Context, tenantID string, after Revision) (<-
 		close(errorsCh)
 		return events, errorsCh
 	}
-	if tenantID == "" {
-		errorsCh <- ErrTenantRequired
+	if err := e.validateTenant(tenantID); err != nil {
+		errorsCh <- err
 		close(events)
 		close(errorsCh)
 		return events, errorsCh
@@ -412,6 +512,12 @@ func (e *Engine) checkThis(ctx context.Context, store TupleReader, caveatContext
 		if tuple.User == user {
 			return true, nil
 		}
+		if tuple.User == "user:*" {
+			if namespace, _, ok := parseDirectSubject(user); ok && namespace == "user" {
+				return true, nil
+			}
+			continue
+		}
 		usersetNamespace, usersetObjectID, usersetRelation, ok := parseUserset(tuple.User)
 		if !ok {
 			continue
@@ -456,6 +562,9 @@ func (e *Engine) checkTupleToUserset(ctx context.Context, store TupleReader, cav
 }
 
 func (e *Engine) evaluateCaveat(ctx context.Context, tuple RelationTuple, request CaveatContext) (bool, error) {
+	if !tupleActiveAt(tuple, request) {
+		return false, nil
+	}
 	if tuple.Caveat == "" {
 		return true, nil
 	}
@@ -465,6 +574,18 @@ func (e *Engine) evaluateCaveat(ctx context.Context, tuple RelationTuple, reques
 		return false, fmt.Errorf("rebac: caveat %q: %w", tuple.Caveat, err)
 	}
 	return allowed, nil
+}
+
+func tupleActiveAt(tuple RelationTuple, request CaveatContext) bool {
+	if tuple.NotBeforeUnixNano == 0 && tuple.NotAfterUnixNano == 0 {
+		return true
+	}
+	asOf, ok := request[asOfContextKey].(int64)
+	if !ok || asOf <= 0 {
+		return false
+	}
+	return (tuple.NotBeforeUnixNano == 0 || asOf >= tuple.NotBeforeUnixNano) &&
+		(tuple.NotAfterUnixNano == 0 || asOf < tuple.NotAfterUnixNano)
 }
 
 func (e *Engine) queryTuples(ctx context.Context, store TupleReader, tenantID string, filter RelationTuple) ([]RelationTuple, error) {
@@ -508,11 +629,11 @@ func wrapStorageError(err error) error {
 // parseUserset accepts Zanzibar's namespace:object#relation subject syntax.
 func parseUserset(user string) (namespace, objectID, relation string, ok bool) {
 	resource, relation, ok := strings.Cut(user, "#")
-	if !ok || relation == "" {
+	if !ok || !validName(relation) || strings.Contains(relation, "#") {
 		return "", "", "", false
 	}
 	namespace, objectID, ok = strings.Cut(resource, ":")
-	if !ok || namespace == "" || objectID == "" {
+	if !ok || !validName(namespace) || !validObjectID(objectID) {
 		return "", "", "", false
 	}
 	return namespace, objectID, relation, true
@@ -523,5 +644,5 @@ func parseDirectSubject(user string) (namespace, objectID string, ok bool) {
 		return "", "", false
 	}
 	namespace, objectID, ok = strings.Cut(user, ":")
-	return namespace, objectID, ok && namespace != "" && objectID != ""
+	return namespace, objectID, ok && validName(namespace) && validObjectID(objectID)
 }

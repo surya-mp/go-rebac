@@ -5,9 +5,9 @@
 
 `go-rebac` is a Go library for relationship-based access control (ReBAC),
 inspired by Google Zanzibar authorization concepts. Define an authorization
-model in Go, store relationship tuples in your own datastore, and evaluate
-tenant-safe authorization checks without running an external permissions
-service.
+model in Go, store relationship tuples in the included embedded store or your
+own datastore, and evaluate tenant-safe authorization checks without running
+an external permissions service.
 
 It is useful when a plain RBAC role table is not enough: document sharing,
 group membership, organization hierarchies, parent-folder permissions, and
@@ -19,8 +19,12 @@ other graph-shaped authorization rules.
   union, intersection, and exclusion.
 - Tenant-scoped checks with cycle, depth, and node limits.
 - Revision-pinned reads and atomic mutations when the storage supports them.
-- Optional PostgreSQL storage, pagination, batched reads, tuple watches, and
-  deterministic application-defined caveats.
+- Portable storage interfaces, backend conformance tests, and optional indexed
+  lookup candidates.
+- Optional Zanzibar-style at-least-as-fresh checks that pin the authorization
+  model and tuple graph to one shared revision.
+- Pagination, batched reads, tuple watches, and deterministic
+  application-defined caveats.
 
 ## Install
 
@@ -28,8 +32,16 @@ other graph-shaped authorization rules.
 go get github.com/surya-mp/go-rebac
 ```
 
-The library does not choose, open, or close a PostgreSQL driver. Your
-application owns its `*sql.DB` and passes it to `NewPostgresStorage`.
+For the zero-setup path, use `kv.NewReBACStore(kv.New())`. The library also
+accepts a `StorageEngine` backed by your existing datastore.
+
+## Documentation
+
+Start with the [documentation index](docs/README.md). It includes guided
+material for [modeling](docs/modeling.md), [storage implementations](docs/storage.md),
+[content consistency](docs/consistency.md), [HTTP integration](docs/http.md),
+and [testing and operations](docs/operations.md).
+Release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Relationship tuple format
 
@@ -53,7 +65,19 @@ rejects graph cycles safely.
 
 ## Quick start
 
+The following body belongs in a function that returns `error`:
+
 ```go
+import (
+	"context"
+	"errors"
+
+	rebac "github.com/surya-mp/go-rebac"
+	"github.com/surya-mp/go-rebac/kv"
+)
+
+ctx := context.Background()
+store := kv.NewReBACStore(kv.New())
 model := rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{
 	"user": {},
 	"group": {Relations: map[string]rebac.RelationDefinition{
@@ -82,11 +106,20 @@ _ = engine.WriteTuple(ctx, rebac.RelationTuple{
 })
 
 allowed, err := engine.Check(ctx, "acme", "user:alice", "viewer", "document", "roadmap")
+if err != nil {
+	return err
+}
+if !allowed {
+	return errors.New("forbidden")
+}
+return nil
 ```
 
-`store` can be any implementation of `StorageEngine`. For PostgreSQL, create
-the database handle in your application, apply `migrations/001_initial.sql`,
-then use `rebac.NewPostgresStorage(db)`.
+`kv.New()` is an in-process store. For durable local storage, use
+`database, err := kv.Open("rebac.json")` and pass `database` to
+`kv.NewReBACStore`. It is a single-process store; do not share its file across
+processes. A distributed database can implement `StorageEngine` and the
+revisioned contracts when cross-process or cross-region consistency is needed.
 
 ## Authorization models
 
@@ -99,8 +132,30 @@ Zanzibar-style relation composition:
 - `TupleToUserset` for a relation on a referenced object.
 - `Union`, `Intersection`, and `Exclusion` for set algebra.
 
-Keep model construction at application startup and treat it as immutable for
-the lifetime of an engine.
+Keep model construction immutable for the lifetime of an engine. For runtime
+model configuration, persist a JSON `ModelDocument` through `ModelStorage`,
+bind application caveats with `Compile`, and construct a new engine for that
+model version. See [docs/model.md](docs/model.md) for the strict portable
+grammar and model-storage contract.
+
+For a production adapter, use `NewProductionEngine` (or
+`NewProductionEngineFromModelStorage`). It requires revision-pinned reads,
+atomic mutations, and both indexed lookup candidate capabilities. Lightweight
+adapters can continue to use `NewEngine` for local tests and prototypes.
+
+For Zanzibar-style content consistency, use
+`NewConsistentEngineFromModelStorage`. Its storage implements
+`ConsistentStorage`, and its model store implements `RevisionedModelStorage`.
+Both use the same externally consistent revision sequence. Call
+`ContentChangeCheck` before saving application content, save its
+`ConsistencyToken` with that content, then pass it to `CheckWithConsistency`
+when the content is read.
+
+For tokens that cross an untrusted HTTP boundary, use `TokenCodec`; the
+standard-library `NewHMACTokenCodec` provides authenticated, expiring tokens.
+`conformance.RunConsistent` exercises the portable strict-storage protocol.
+The bundled `kv` store satisfies that protocol inside one process; it does not
+create global replication or external consistency on its own.
 
 ## Consistency and operations
 
@@ -121,23 +176,14 @@ deterministic and must not perform I/O. Revision-pinned decisions can use a
 `DecisionCache`; call `WatchCacheInvalidation` to invalidate tenant entries
 after committed tuple changes.
 
-## PostgreSQL
-
-`PostgresStorage` uses `database/sql` with an application-provided connection
-pool. Apply [migrations/001_initial.sql](migrations/001_initial.sql) through
-your existing migration tool. The schema stores revisions and tombstones to
-support snapshot reads, revision-pinned checks, atomic mutations, pagination,
-and tuple change watches.
-
-The application selects its database driver, pool settings, TLS policy, and
-database lifecycle. This package does not open connections or bundle a driver.
-
 ## API guide
 
 | Need | API |
 | --- | --- |
 | Check one permission | `Check` or `CheckWithContext` |
 | Keep a decision stable | `CheckWithRevision` |
+| Check no older than content | `CheckWithConsistency` |
+| Produce a content token | `ContentChangeCheck` |
 | Write one tuple | `WriteTupleWithRevision` |
 | Change tuples atomically | `Mutate` |
 | Page through tuples | `ReadTuples` or `ReadTuplesBatch` |
@@ -148,6 +194,19 @@ database lifecycle. This package does not open connections or bundle a driver.
 For a concise API map, see [docs/api.md](docs/api.md). Exported Go comments
 remain the canonical symbol documentation on pkg.go.dev.
 
+Storage authors can reuse `conformance.Run` in their own tests. Add
+`ResourceCandidateReader` or `SubjectCandidateReader` only when native indexes
+can return a complete candidate superset; the normal storage interface remains
+the portability baseline.
+
+## Optional HTTP service
+
+The dependency-free [`server`](server) package exposes a configured Engine as
+standard `net/http` data-plane and separately mounted admin handlers. It does
+not open a database, authenticate callers, or start a listener, so applications
+retain their existing driver, middleware, and deployment choices. See
+[docs/server.md](docs/server.md) for routes and mounting guidance.
+
 ## Development
 
 ```sh
@@ -156,14 +215,11 @@ go test -race ./...
 go vet ./...
 ```
 
-To run the PostgreSQL integration test, provide `REBAC_TEST_POSTGRES_DSN` and
-link your chosen `database/sql` driver in the CI integration-test harness.
-
 ## Project keywords
 
 Go authorization, ReBAC, relationship-based access control, Zanzibar,
-authorization model, permission checks, RBAC migration, PostgreSQL, and tuple
-graph evaluation.
+authorization model, permission checks, RBAC migration, and tuple graph
+evaluation.
 
 ## License
 
