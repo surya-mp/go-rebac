@@ -116,4 +116,4 @@ be deterministic and free of I/O because they run during authorization checks.
 `github.com/surya-mp/go-rebac/server` provides optional standard-library HTTP
 handlers over a configured Engine. Its read-only data plane and privileged
 tuple-mutation plane are separate. `server.NewClient` supplies the matching
-typed standard-library client. See [server.md](server.md).
+typed standard-library client. See [http.md](http.md).

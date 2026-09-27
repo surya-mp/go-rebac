@@ -24,6 +24,7 @@ the host configures authentication on that HTTP client's transport.
 | --- | --- | --- |
 | `GET /healthz` | none | `{"status":"ok"}` |
 | `POST /v1/check` | `CheckRequest` | allowed + revision |
+| `POST /v1/batch-check` | `BatchCheckRequest` | ordered check results |
 | `POST /v1/check/consistent` | `ConsistentCheckRequest` | allowed + token |
 | `POST /v1/content-change-check` | `ContentChangeCheckRequest` | allowed + token |
 | `POST /v1/tuples/read` | `ReadTuplesRequest` | `TuplePage` |

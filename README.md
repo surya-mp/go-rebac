@@ -106,14 +106,18 @@ if err != nil {
 	return err
 }
 
-_ = engine.WriteTuple(ctx, rebac.RelationTuple{
+if err := engine.WriteTuple(ctx, rebac.RelationTuple{
 	TenantID: "acme", Namespace: "group", ObjectID: "eng",
 	Relation: "member", User: "user:alice",
-})
-_ = engine.WriteTuple(ctx, rebac.RelationTuple{
+}); err != nil {
+	return err
+}
+if err := engine.WriteTuple(ctx, rebac.RelationTuple{
 	TenantID: "acme", Namespace: "document", ObjectID: "roadmap",
 	Relation: "viewer", User: "group:eng#member",
-})
+}); err != nil {
+	return err
+}
 
 allowed, err := engine.Check(ctx, "acme", "user:alice", "viewer", "document", "roadmap")
 if err != nil {
@@ -225,7 +229,7 @@ The dependency-free [`server`](server) package exposes a configured Engine as
 standard `net/http` data-plane and separately mounted admin handlers. It does
 not open a database, authenticate callers, or start a listener, so applications
 retain their existing driver, middleware, and deployment choices. See
-[docs/server.md](docs/server.md) for routes and mounting guidance.
+[docs/http.md](docs/http.md) for routes and mounting guidance.
 
 ## Development
 

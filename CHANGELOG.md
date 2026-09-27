@@ -4,6 +4,9 @@
 
 - Consolidate GitHub Actions validation and tag-release automation into one
   workflow, while keeping signing and release permissions tag-scoped.
+- Consolidate duplicate HTTP documentation into `docs/http.md`.
+- Align the threat model and quickstart with the current package boundary and
+  error-handling contract.
 
 ## v0.5.0
 

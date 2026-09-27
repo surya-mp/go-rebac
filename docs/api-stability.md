@@ -4,9 +4,8 @@ The module follows Go module semantic import versioning.
 
 ## Go compatibility
 
-The supported baseline is Go 1.27.1, the current stable Go release. CI runs
-the complete security suite on that exact version. A future release may drop a
-Go version only in a minor release, with the change recorded in
+The minimum supported Go version is 1.27.1. CI runs the complete security
+suite on that version. Any future minimum-version change is recorded in
 `CHANGELOG.md`.
 
 ## Before v1
