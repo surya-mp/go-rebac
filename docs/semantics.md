@@ -1,89 +1,39 @@
-# Authorization semantics
+# Authorization semantics guide
 
-This document is the normative decision contract for `go-rebac`. For a fixed
-model, tuple snapshot, request, caveat context, and validity time, a decision
-is deterministic. An authorization error always returns `allowed == false`.
+[`SPEC.md`](../SPEC.md) is the sole normative behavioral contract for
+`go-rebac`. This guide is deliberately non-normative: use it to orient yourself
+before reading the relevant numbered specification clause.
 
-## Inputs and graph nodes
+## Compact conceptual model
 
-`Check` evaluates a request `(tenant, subject, relation, namespace, object)`
-against the relation node `namespace:object#relation`. Every storage query is
-scoped to that tenant. A tuple is usable only when it is syntactically valid,
-allowed by the model, active at the requested time, and its caveat (if any)
-returns true.
+An authorization view combines an immutable model, tenant-scoped live tuples,
+and a snapshot revision. A check asks whether a subject has one relation on one
+object in that view. A successful check has a witness path through direct
+tuples, usersets, and rewrite rules. No witness means a normal denial; a
+failure to evaluate safely means denial plus error.
 
-| Construct | Traversal | Result |
-| --- | --- | --- |
-| `This` | Read tuples on the current relation. | Grant on an exact subject match, a matching nested userset, or `user:*`. |
-| Direct user | Compare the tuple subject to the request subject. | Equal subjects grant. |
-| Userset | Follow `namespace:object#relation` in a tuple. | The tuple grants when the target relation grants. |
-| `user:*` | Match a direct request subject in namespace `user`. | Grants every `user:<id>`; it never grants a userset. |
-| `ComputedUserset` | Evaluate its named relation on the current object. | Target result. |
-| `TupleToUserset` | Read direct-object tuples on `Tupleset`, then evaluate `ComputedUserset` on each referenced object. | Any matching target grants. |
-| `Union` | Evaluate children in declaration order. | First grant grants; all denials deny. |
-| `Intersection` | Evaluate children in declaration order. | Every child must grant. |
-| `Exclusion` | Evaluate `Base`, then `Subtract` only when base grants. | Grant only when base grants and subtract denies. |
+The complete decision rules are [S1–S4](../SPEC.md#s1-authorization-view-and-outcomes),
+with tuple eligibility in [S2](../SPEC.md#s2-validity-and-tuple-eligibility).
 
-Rewrites nest recursively. The declared order is observable only for traversal
-cost and the first error; it never changes a successful boolean result when no
-error occurs. Missing tuples simply make that branch deny.
+## Reading a model
 
-`Expand` is a privileged graph-inspection API, not an alternate decision
-algorithm. Each output node carries its object, relation, rewrite, snapshot
-revision, model identity/version, active direct tuples, and nested-userset
-children. It applies the same tuple validation, caveat/time, tenant, cycle,
-depth, node, tuple-read, storage-call, and cancellation rules as `Check`; its
-separate output budget counts returned nodes and tuples.
+`This` evaluates tuples on a relation. A computed userset moves sideways to
+another relation on the same object. Tuple-to-userset follows an object edge,
+then checks a relation on the referenced object. Union, intersection, and
+exclusion combine those checks. The exact short-circuit and error behavior is
+defined by [S3](../SPEC.md#s3-evaluation-rules).
 
-`LookupResources` and `LookupSubjects` first obtain a complete candidate
-superset, then verify each candidate with the same revision-pinned `Check`
-evaluator. An empty point-in-time value is exactly ordinary `Check` semantics;
-it is not exposed to caveats as a synthetic timestamp.
+## Time, recursion, and views
 
-## Wildcards, caveats, and time
+Tuple caveats and validity intervals determine whether a tuple is usable.
+Cycles and graph limits fail closed. Snapshot-pinned APIs use an exact view;
+consistency-token APIs select a view no older than their input token. See
+[S4](../SPEC.md#s4-recursion-determinism-and-budgets) and
+[S5](../SPEC.md#s5-revisions-and-snapshots).
 
-Wildcard support is opt-in per relation with `AllowWildcard`. The only
-wildcard subject is `user:*`; `group:*`, userset wildcards, and wildcard check
-subjects are invalid. A wildcard participates in `This` before surrounding
-union, intersection, or exclusion operators, so ordinary rewrite rules apply
-unchanged.
+## Executable reference scenarios
 
-A caveat runs after a tuple has been found. False makes that tuple inapplicable;
-an evaluator error fails the entire decision closed. A tuple validity interval
-is half-open: `NotBeforeUnixNano <= asOfUnixNano < NotAfterUnixNano`. Ordinary
-checks have no `asOf` time and therefore deny interval-bearing tuples.
-
-Models are capped at 1 MiB encoded JSON. Tuple and request caveat contexts
-must be JSON-serializable and are capped at 64 KiB encoded JSON. Oversized or
-invalid input is rejected before storage or evaluation.
-
-## Recursion and bounds
-
-The evaluator keeps a path-local set of relation nodes. Revisiting an active
-node is a cycle and returns `ErrCycleDetected`; it never grants. A repeated
-node reached after its prior branch returns is evaluated normally. Depth and
-node budgets are independent: exceeding either returns `ErrMaxDepthExceeded`
-or `ErrMaxNodesExceeded`. These errors fail the whole decision closed.
-
-## Failure and isolation rules
-
-| Condition | Decision |
-| --- | --- |
-| Missing live tuple or inactive/deleted tuple | deny, no error |
-| Invalid request, tuple, model, or model version | deny, error |
-| Storage, snapshot, revision, or model-read error | deny, error |
-| Caveat evaluator error | deny, error |
-| Cycle, depth/node/tuple-read/storage-call/time/output limit | deny, error |
-| Cross-tenant tuple returned by storage | deny, error |
-| Tenant/model mismatch | deny, error |
-
-Object deletion removes outgoing relationships. References to a deleted object
-cannot grant while its target relations are empty; `kv.ReBACStore` can later
-remove those inbound references with bounded garbage collection.
-
-## Revisions and models
-
-`CheckWithRevision` uses one tuple snapshot. The consistent APIs additionally
-load the model effective at that same externally ordered revision. An empty
-revision selects the latest snapshot supported by storage. Storage adapters
-must not mix tuple/model revisions or return cross-tenant tuples.
+`conformance.RunReferenceScenarios` exercises the direct, nested, wildcard,
+computed, tuple-to-userset, set-algebra, missing-tuple, tenant, and
+witness-removal cases. The scenario-to-clause mapping and its limits are in
+[S8](../SPEC.md#s8-conformance-mapping-and-proof-obligations).

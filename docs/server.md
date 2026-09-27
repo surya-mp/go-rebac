@@ -21,6 +21,10 @@ appMux.Handle("/authz/", http.StripPrefix("/authz", api.Handler()))
 adminMux.Handle("/authz-admin/", http.StripPrefix("/authz-admin", api.AdminHandler()))
 ```
 
+Use `api.WithModelStorage(models)` to expose model administration routes. The
+same package provides `server.NewClient(baseURL, httpClient)` for typed calls;
+configure authentication on the supplied client's transport.
+
 `Handler` is the data plane:
 
 | Method and path | Operation |
@@ -38,6 +42,10 @@ adminMux.Handle("/authz-admin/", http.StripPrefix("/authz-admin", api.AdminHandl
 `AdminHandler` is intentionally separate. Protect it with stricter application
 authorization before exposing `POST /v1/tuples/write`,
 `POST /v1/tuples/delete`, or `POST /v1/tuples/mutate`.
+
+With model storage configured, `Handler` also serves `POST /v1/models/read`,
+`/v1/models/versions`, and `/v1/models/active`; `AdminHandler` serves
+`POST /v1/models/write` and `/v1/models/activate`.
 
 The handlers use JSON with the field names shown in the Go request types. A
 single request body is limited to 1 MiB, requests time out after five seconds,

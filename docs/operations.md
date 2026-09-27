@@ -51,6 +51,9 @@ do not convert them to an authorization allow.
 
 `WithRequestCoalescing` coalesces identical concurrent `Check` calls within
 one Go process. `WithDecisionCache` caches only revision-pinned decisions.
+Compiled authorization models use a process-local 128-entry LRU cache keyed by
+tenant, model ID, version, and checksum; archived versions therefore cannot
+grow process memory without bound.
 Keys include tenant, compiled model identity, model version, tuple revision,
 request, and caveat context. Cache implementations are application-owned;
 invalidate them through `Watch` or `WatchCacheInvalidation` after committed

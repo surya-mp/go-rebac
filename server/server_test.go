@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/surya-mp/go-rebac"
+	"github.com/surya-mp/go-rebac/kv"
 )
 
 type memoryStore []rebac.RelationTuple
@@ -87,5 +88,72 @@ func TestHandlers(t *testing.T) {
 	limited.Handler().ServeHTTP(tooLarge, httptest.NewRequest(http.MethodPost, "/v1/batch-check", strings.NewReader(`{"checks":[{},{}]}`)))
 	if tooLarge.Code != http.StatusBadRequest {
 		t.Fatalf("batch limit status = %d: %s", tooLarge.Code, tooLarge.Body.String())
+	}
+}
+
+func TestClientUsesDataEndpoints(t *testing.T) {
+	store := &memoryStore{}
+	engine, err := rebac.NewEngine(store, rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{
+		"user":     {},
+		"document": {Relations: map[string]rebac.RelationDefinition{"viewer": {AllowedSubjects: []rebac.SubjectReference{{Namespace: "user"}}}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers, err := New(engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/", handlers.Handler())
+	mux.Handle("/v1/tuples/", handlers.AdminHandler())
+	remote := httptest.NewServer(mux)
+	defer remote.Close()
+	client, err := NewClient(remote.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	if _, err := client.WriteTuple(context.Background(), tuple); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Check(context.Background(), CheckRequest{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"})
+	if err != nil || !response.Allowed {
+		t.Fatalf("Check() = %#v, %v", response, err)
+	}
+}
+
+func TestClientUsesModelEndpoints(t *testing.T) {
+	engine, err := rebac.NewEngine(&memoryStore{}, rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers, err := New(engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers = handlers.WithModelStorage(kv.NewReBACStore(kv.New()))
+	mux := http.NewServeMux()
+	mux.Handle("POST /v1/models/read", handlers.Handler())
+	mux.Handle("POST /v1/models/versions", handlers.Handler())
+	mux.Handle("POST /v1/models/active", handlers.Handler())
+	mux.Handle("POST /v1/models/write", handlers.AdminHandler())
+	mux.Handle("POST /v1/models/activate", handlers.AdminHandler())
+	remote := httptest.NewServer(mux)
+	defer remote.Close()
+	client, err := NewClient(remote.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := client.WriteModel(context.Background(), WriteModelRequest{TenantID: "acme", Document: rebac.ModelDocument{ID: "access", Model: rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ActivateModel(context.Background(), ActivateModelRequest{TenantID: "acme", ModelID: "access", Version: stored.Version}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := client.ReadActiveModel(context.Background(), ReadModelRequest{TenantID: "acme", ModelID: "access"})
+	if err != nil || active.Version != stored.Version {
+		t.Fatalf("ReadActiveModel() = %#v, %v", active, err)
 	}
 }

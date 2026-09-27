@@ -77,9 +77,26 @@ type SubjectPage struct {
 	NextCursor string   `json:"next_cursor,omitempty"`
 }
 
-// Expansion represents direct relationship edges and nested usersets for one
-// relation. Rewrite describes the model operation applied at this node.
+// ExpansionKind identifies a node in the canonical relationship-expression
+// tree returned by Expand.
+type ExpansionKind string
+
+const (
+	ExpansionRelation        ExpansionKind = "relation"
+	ExpansionThis            ExpansionKind = "this"
+	ExpansionComputedUserset ExpansionKind = "computed_userset"
+	ExpansionTupleToUserset  ExpansionKind = "tuple_to_userset"
+	ExpansionUnion           ExpansionKind = "union"
+	ExpansionIntersection    ExpansionKind = "intersection"
+	ExpansionExclusion       ExpansionKind = "exclusion"
+)
+
+// Expansion is a canonical, ordered relationship-expression tree. A relation
+// node has one child representing its rewrite. This and tuple-to-userset nodes
+// carry their active source tuples; relation children represent referenced
+// usersets. Union, intersection, and exclusion preserve model operand order.
 type Expansion struct {
+	Kind         ExpansionKind   `json:"kind"`
 	Namespace    string          `json:"namespace"`
 	ObjectID     string          `json:"object_id"`
 	Relation     string          `json:"relation"`
@@ -204,7 +221,7 @@ func (e *Engine) LookupResources(ctx context.Context, request LookupResourcesReq
 	if err := e.model.validateCheck(request.User, request.Relation, request.Namespace, "lookup"); err != nil {
 		return ResourcePage{}, err
 	}
-	revision := request.Revision
+	var revision Revision
 	var candidates []string
 	if indexed, ok := e.store.(ResourceCandidateReader); ok {
 		used, err := e.resolveRevision(ctx, request.Revision)
@@ -261,7 +278,7 @@ func (e *Engine) LookupSubjects(ctx context.Context, request LookupSubjectsReque
 	if err := e.model.validateCheck(request.SubjectNamespace+":lookup", request.Relation, request.Namespace, request.ObjectID); err != nil {
 		return SubjectPage{}, err
 	}
-	revision := request.Revision
+	var revision Revision
 	candidates := make(map[string]struct{})
 	if indexed, ok := e.store.(SubjectCandidateReader); ok {
 		used, err := e.resolveRevision(ctx, request.Revision)
@@ -310,7 +327,9 @@ func (e *Engine) LookupSubjects(ctx context.Context, request LookupSubjectsReque
 	return SubjectPage{Subjects: items, Revision: revision, NextCursor: next}, nil
 }
 
-// Expand returns direct tuples and userset edges for one relation at revision.
+// Expand returns the canonical relationship-expression tree for one relation
+// at revision. It evaluates every rewrite form but does not decide for a
+// particular subject; use Check for that.
 func (e *Engine) Expand(ctx context.Context, revision Revision, tenantID, relation, namespace, objectID string) (Expansion, Revision, error) {
 	return e.ExpandAt(ctx, revision, 0, tenantID, relation, namespace, objectID)
 }
@@ -363,41 +382,131 @@ func (e *Engine) expand(ctx context.Context, reader TupleReader, caveatContext C
 	visiting[key] = struct{}{}
 	defer delete(visiting, key)
 
-	tuples, err := e.queryTuples(ctx, reader, tenantID, RelationTuple{Namespace: namespace, ObjectID: objectID, Relation: relation})
+	definition := e.model.Namespaces[namespace].Relations[relation]
+	expression, err := e.expandRewrite(ctx, reader, caveatContext, tenantID, relation, namespace, objectID, revision, definition.Rewrite, visiting, depth, nodes, output)
 	if err != nil {
 		return Expansion{}, err
+	}
+	return Expansion{Kind: ExpansionRelation, Namespace: namespace, ObjectID: objectID, Relation: relation, Revision: revision, ModelID: e.modelID, ModelVersion: e.modelVersion, Rewrite: definition.Rewrite, Children: []Expansion{expression}}, nil
+}
+
+func (e *Engine) expandRewrite(ctx context.Context, reader TupleReader, caveatContext CaveatContext, tenantID, relation, namespace, objectID string, revision Revision, rewrite Rewrite, visiting map[checkKey]struct{}, depth int, nodes, output *int) (Expansion, error) {
+	if err := ctx.Err(); err != nil {
+		return Expansion{}, err
+	}
+	if *nodes >= e.maxNodes {
+		return Expansion{}, ErrMaxNodesExceeded
+	}
+	if *output >= e.maxExpansionOutput {
+		return Expansion{}, ErrMaxExpansionOutput
+	}
+	(*nodes)++
+	(*output)++
+	kind, err := rewrite.kind()
+	if err != nil {
+		return Expansion{}, err
+	}
+	node := Expansion{Namespace: namespace, ObjectID: objectID, Relation: relation, Revision: revision, ModelID: e.modelID, ModelVersion: e.modelVersion, Rewrite: rewrite}
+	switch kind {
+	case "this":
+		node.Kind = ExpansionThis
+		tuples, err := e.activeExpansionTuples(ctx, reader, caveatContext, tenantID, namespace, objectID, relation, output)
+		if err != nil {
+			return Expansion{}, err
+		}
+		node.Tuples = tuples
+		for _, tuple := range tuples {
+			childNamespace, childObjectID, childRelation, ok := parseUserset(tuple.User)
+			if !ok {
+				continue
+			}
+			child, err := e.expand(ctx, reader, caveatContext, tenantID, childRelation, childNamespace, childObjectID, revision, visiting, depth+1, nodes, output)
+			if err != nil {
+				return Expansion{}, err
+			}
+			node.Children = append(node.Children, child)
+		}
+	case "computed":
+		node.Kind = ExpansionComputedUserset
+		child, err := e.expand(ctx, reader, caveatContext, tenantID, rewrite.ComputedUserset, namespace, objectID, revision, visiting, depth+1, nodes, output)
+		if err != nil {
+			return Expansion{}, err
+		}
+		node.Children = []Expansion{child}
+	case "tuple-to-userset":
+		node.Kind = ExpansionTupleToUserset
+		tuples, err := e.activeExpansionTuples(ctx, reader, caveatContext, tenantID, namespace, objectID, rewrite.TupleToUserset.Tupleset, output)
+		if err != nil {
+			return Expansion{}, err
+		}
+		node.Tuples = tuples
+		for _, tuple := range tuples {
+			targetNamespace, targetObjectID, ok := parseDirectSubject(tuple.User)
+			if !ok {
+				continue
+			}
+			child, err := e.expand(ctx, reader, caveatContext, tenantID, rewrite.TupleToUserset.ComputedUserset, targetNamespace, targetObjectID, revision, visiting, depth+1, nodes, output)
+			if err != nil {
+				return Expansion{}, err
+			}
+			node.Children = append(node.Children, child)
+		}
+	case "union", "intersection":
+		if kind == "union" {
+			node.Kind = ExpansionUnion
+		} else {
+			node.Kind = ExpansionIntersection
+		}
+		branches := rewrite.Union
+		if kind == "intersection" {
+			branches = rewrite.Intersection
+		}
+		for _, branch := range branches {
+			child, err := e.expandRewrite(ctx, reader, caveatContext, tenantID, relation, namespace, objectID, revision, branch, visiting, depth, nodes, output)
+			if err != nil {
+				return Expansion{}, err
+			}
+			node.Children = append(node.Children, child)
+		}
+	case "exclusion":
+		node.Kind = ExpansionExclusion
+		for _, branch := range []Rewrite{rewrite.Exclusion.Base, rewrite.Exclusion.Subtract} {
+			child, err := e.expandRewrite(ctx, reader, caveatContext, tenantID, relation, namespace, objectID, revision, branch, visiting, depth, nodes, output)
+			if err != nil {
+				return Expansion{}, err
+			}
+			node.Children = append(node.Children, child)
+		}
+	default:
+		return Expansion{}, ErrInvalidRequest
+	}
+	return node, nil
+}
+
+func (e *Engine) activeExpansionTuples(ctx context.Context, reader TupleReader, caveatContext CaveatContext, tenantID, namespace, objectID, relation string, output *int) ([]RelationTuple, error) {
+	tuples, err := e.queryTuples(ctx, reader, tenantID, RelationTuple{Namespace: namespace, ObjectID: objectID, Relation: relation})
+	if err != nil {
+		return nil, err
 	}
 	active := tuples[:0]
 	for _, tuple := range tuples {
 		if err := ctx.Err(); err != nil {
-			return Expansion{}, err
+			return nil, err
 		}
 		applies, err := e.evaluateCaveat(ctx, tuple, caveatContext)
 		if err != nil {
-			return Expansion{}, err
+			return nil, err
 		}
 		if applies {
 			active = append(active, tuple)
 		}
 	}
-	tuples = active
-	if len(tuples) > e.maxExpansionOutput-*output {
-		return Expansion{}, ErrMaxExpansionOutput
+	sortTuples(active)
+	if len(active) > e.maxExpansionOutput-*output {
+		return nil, ErrMaxExpansionOutput
 	}
-	*output += len(tuples)
-	expansion := Expansion{Namespace: namespace, ObjectID: objectID, Relation: relation, Revision: revision, ModelID: e.modelID, ModelVersion: e.modelVersion, Rewrite: e.model.Namespaces[namespace].Relations[relation].Rewrite, Tuples: tuples}
-	for _, tuple := range tuples {
-		childNamespace, childObjectID, childRelation, ok := parseUserset(tuple.User)
-		if !ok {
-			continue
-		}
-		child, err := e.expand(ctx, reader, caveatContext, tenantID, childRelation, childNamespace, childObjectID, revision, visiting, depth+1, nodes, output)
-		if err != nil {
-			return Expansion{}, err
-		}
-		expansion.Children = append(expansion.Children, child)
-	}
-	return expansion, nil
+	*output += len(active)
+	return active, nil
 }
 
 func (e *Engine) readView(ctx context.Context, revision Revision) (TupleReader, Revision, func() error, error) {

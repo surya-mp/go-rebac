@@ -5,9 +5,13 @@ and deletes. Tuple reads must return only tuples matching the requested tenant;
 the evaluator revalidates every returned tuple and denies on violations.
 
 Production adapters should implement `ProductionStorage`: atomic mutation,
-revisioned snapshots, and complete resource/subject candidate readers. To use
-the Zanzibar-style consistency APIs, implement `ConsistentStorage` and make
-tuple snapshots and model reads share the same ordered revision sequence.
+exact and at-least-fresh snapshots, revision-matched indexes, and resumable
+tenant/global changelogs. Interface conformance does not establish physical
+durability or external consistency; prove those with backend-specific fault
+tests.
+To use the Zanzibar-style model-consistency APIs, use `ConsistentStorage` with
+`RevisionedModelStorage` so tuple snapshots and model reads share one ordered
+revision sequence.
 
 Candidate readers may return extra candidates, but never omit a resource or
 subject that can pass `Check` at the requested revision. The engine verifies

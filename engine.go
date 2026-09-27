@@ -56,6 +56,7 @@ type Engine struct {
 	modelSource        ModelSnapshotStorage
 	caveats            map[string]CaveatDefinition
 	coalescer          *checkCoalescer
+	dispatcher         CheckDispatcher
 }
 
 // NewEngine compiles the application-owned authorization model and uses store
@@ -162,7 +163,7 @@ func (e *Engine) Stats() Stats {
 
 func newEngine(store StorageEngine, model AuthorizationModel, maxDepth, maxNodes, maxTuplesRead, maxStorageCalls int, maxEvaluationTime time.Duration, maxExpansionOutput int) *Engine {
 	modelHash, _ := (ModelDocument{ID: "compiled", Model: model}).ComputeChecksum()
-	return &Engine{store: store, model: model, maxDepth: maxDepth, maxNodes: maxNodes, maxTuplesRead: maxTuplesRead, maxStorageCalls: maxStorageCalls, maxEvaluationTime: maxEvaluationTime, maxExpansionOutput: maxExpansionOutput, modelHash: modelHash, compiledModels: &compiledModelCache{models: make(map[compiledModelKey]*CompiledModel)}, stats: &engineStats{}}
+	return &Engine{store: store, model: model, maxDepth: maxDepth, maxNodes: maxNodes, maxTuplesRead: maxTuplesRead, maxStorageCalls: maxStorageCalls, maxEvaluationTime: maxEvaluationTime, maxExpansionOutput: maxExpansionOutput, modelHash: modelHash, compiledModels: newCompiledModelCache(defaultCompiledModelCacheSize), stats: &engineStats{}}
 }
 
 // Check reports whether user has relation on namespace:objectID within tenantID.
@@ -280,6 +281,16 @@ func (e *Engine) CheckWithRevisionAndContext(ctx context.Context, revision Revis
 	}
 	if err := e.model.validateCheck(user, relation, namespace, objectID); err != nil {
 		return false, "", err
+	}
+	if e.dispatcher != nil {
+		result, dispatchErr := e.dispatcher.DispatchCheck(ctx, CheckDispatchRequest{TenantID: tenantID, User: user, Relation: relation, Namespace: namespace, ObjectID: objectID, Revision: revision, CaveatContext: caveatContext})
+		if dispatchErr != nil {
+			return false, "", fmt.Errorf("%w: %v", ErrDispatch, dispatchErr)
+		}
+		if revision != "" && result.Revision != revision {
+			return false, "", fmt.Errorf("%w: dispatcher returned revision %q for requested revision %q", ErrDispatch, result.Revision, revision)
+		}
+		return result.Allowed, result.Revision, nil
 	}
 	if explainTraceFromContext(ctx) == nil {
 		if key, ok := decisionCacheKey(e.modelID, e.modelVersion, e.modelHash, revision, tenantID, user, relation, namespace, objectID, caveatContext); ok && e.cache != nil {
@@ -503,6 +514,27 @@ func (e *Engine) Watch(ctx context.Context, tenantID string, after Revision) (<-
 		return events, errorsCh
 	}
 	return storage.Watch(ctx, tenantID, after)
+}
+
+// WatchAllTuples streams the durable global changelog when the storage
+// supports it. Callers are responsible for authorizing cross-tenant access.
+func (e *Engine) WatchAllTuples(ctx context.Context, request GlobalWatchRequest) (<-chan WatchEvent, <-chan error) {
+	events := make(chan WatchEvent)
+	errorsCh := make(chan error, 1)
+	if e == nil || e.store == nil {
+		errorsCh <- errors.New("rebac: storage engine is nil")
+		close(events)
+		close(errorsCh)
+		return events, errorsCh
+	}
+	storage, ok := e.store.(GlobalWatchStorage)
+	if !ok {
+		errorsCh <- ErrRevisionsUnsupported
+		close(events)
+		close(errorsCh)
+		return events, errorsCh
+	}
+	return storage.WatchAllTuples(ctx, request)
 }
 
 type checkKey struct {

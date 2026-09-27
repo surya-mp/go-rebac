@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.0
+
+- Expand the normative specification with compact decision, snapshot, API, and
+  invariant contracts in a top-level `SPEC.md`; add executable reference
+  scenarios and a historical model-at-tuple-revision conformance assertion.
+- Make `Expand` produce a canonical rewrite-expression tree, add a
+  transport-neutral exact-snapshot check-dispatch boundary, and add a durable,
+  resumable global tuple changelog to the KV adapter.
+- Add config-first namespace model operations, configurable KV record prefixes
+  and transaction conflict retries, model HTTP administration endpoints, and a
+  matching typed HTTP client.
+
 ## v0.3.0
 
 - Complete Zanzibar-style evaluator hardening: formal semantics, strict model

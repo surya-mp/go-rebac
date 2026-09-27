@@ -13,7 +13,113 @@ import (
 	"sync"
 )
 
-var ErrClosed = errors.New("rebac/kv: transaction is closed")
+var (
+	ErrClosed              = errors.New("rebac/kv: transaction is closed")
+	ErrTransactionConflict = errors.New("rebac/kv: transaction conflict")
+)
+
+// Reader is one point-in-time KV read view. Host-backed implementations must
+// return a stable view for its lifetime.
+type Reader interface {
+	Get(ctx context.Context, key string) ([]byte, bool, error)
+	Ascend(ctx context.Context, prefix string) ([]string, error)
+	Close() error
+}
+
+// WriteTransaction is one atomic read-modify-write KV operation.
+type WriteTransaction interface {
+	Reader
+	Set(ctx context.Context, key string, value []byte) error
+	Delete(ctx context.Context, key string) error
+	Commit(ctx context.Context) (uint64, error)
+	Rollback(ctx context.Context) error
+}
+
+// Backend is the host-supplied KV contract used by ReBACStore. It deliberately
+// mirrors only the snapshot and transaction guarantees the store needs.
+type Backend interface {
+	Snapshot(ctx context.Context) (Reader, error)
+	Transaction(ctx context.Context) (WriteTransaction, error)
+}
+
+// prefixedBackend isolates one ReBACStore's records inside an application
+// supplied backend. Keys returned to the store never include prefix.
+type prefixedBackend struct {
+	Backend
+	prefix string
+}
+
+func withPrefix(backend Backend, prefix string) Backend {
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return backend
+	}
+	return prefixedBackend{Backend: backend, prefix: prefix + "/"}
+}
+
+func (b prefixedBackend) Snapshot(ctx context.Context) (Reader, error) {
+	reader, err := b.Backend.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return prefixedReader{Reader: reader, prefix: b.prefix}, nil
+}
+
+func (b prefixedBackend) Transaction(ctx context.Context) (WriteTransaction, error) {
+	tx, err := b.Backend.Transaction(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return prefixedTransaction{WriteTransaction: tx, prefix: b.prefix}, nil
+}
+
+type prefixedReader struct {
+	Reader
+	prefix string
+}
+
+func (r prefixedReader) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	return r.Reader.Get(ctx, r.prefix+key)
+}
+
+func (r prefixedReader) Ascend(ctx context.Context, prefix string) ([]string, error) {
+	keys, err := r.Reader.Ascend(ctx, r.prefix+prefix)
+	if err != nil {
+		return nil, err
+	}
+	for index := range keys {
+		keys[index] = strings.TrimPrefix(keys[index], r.prefix)
+	}
+	return keys, nil
+}
+
+type prefixedTransaction struct {
+	WriteTransaction
+	prefix string
+}
+
+func (t prefixedTransaction) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	return t.WriteTransaction.Get(ctx, t.prefix+key)
+}
+
+func (t prefixedTransaction) Ascend(ctx context.Context, prefix string) ([]string, error) {
+	keys, err := t.WriteTransaction.Ascend(ctx, t.prefix+prefix)
+	if err != nil {
+		return nil, err
+	}
+	for index := range keys {
+		keys[index] = strings.TrimPrefix(keys[index], t.prefix)
+	}
+	return keys, nil
+}
+
+func (t prefixedTransaction) Set(ctx context.Context, key string, value []byte) error {
+	return t.WriteTransaction.Set(ctx, t.prefix+key, value)
+}
+
+func (t prefixedTransaction) Delete(ctx context.Context, key string) error {
+	return t.WriteTransaction.Delete(ctx, t.prefix+key)
+}
 
 // Database stores byte values behind snapshot and transaction handles.
 type Database struct {
@@ -22,6 +128,8 @@ type Database struct {
 	revision uint64
 	path     string
 }
+
+var _ Backend = (*Database)(nil)
 
 // New creates an in-process KV database. Persistence belongs to a later
 // durable backend; this constructor performs no I/O.
@@ -73,6 +181,9 @@ func (d *Database) NewSnapshot(ctx context.Context) (*Snapshot, error) {
 	d.mu.RUnlock()
 	return &Snapshot{values: values, revision: revision}, nil
 }
+
+// Snapshot satisfies Backend for the bundled in-memory/file implementation.
+func (d *Database) Snapshot(ctx context.Context) (Reader, error) { return d.NewSnapshot(ctx) }
 
 // Revision identifies the snapshot's database view.
 func (s *Snapshot) Revision() uint64 { return s.revision }
@@ -126,6 +237,11 @@ func (d *Database) NewTransaction(ctx context.Context) (*Transaction, error) {
 	return &Transaction{Snapshot: snapshot, db: d, writes: make(map[string]*[]byte)}, nil
 }
 
+// Transaction satisfies Backend for the bundled in-memory/file implementation.
+func (d *Database) Transaction(ctx context.Context) (WriteTransaction, error) {
+	return d.NewTransaction(ctx)
+}
+
 func (t *Transaction) Set(ctx context.Context, key string, value []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -160,7 +276,8 @@ func (t *Transaction) Commit(ctx context.Context) (uint64, error) {
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 	if t.db.revision != t.revision {
-		return 0, errors.New("rebac/kv: transaction conflict")
+		t.closed = true
+		return 0, ErrTransactionConflict
 	}
 	next := clone(t.db.values)
 	for key, value := range t.writes {
@@ -179,6 +296,18 @@ func (t *Transaction) Commit(ctx context.Context) (uint64, error) {
 	return t.db.revision, nil
 }
 
+// Rollback discards staged writes.
+func (t *Transaction) Rollback(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t.closed {
+		return ErrClosed
+	}
+	t.closed = true
+	return nil
+}
+
 func (d *Database) persistLocked(values map[string][]byte, revision uint64) error {
 	if d.path == "" {
 		return nil
@@ -195,10 +324,30 @@ func (d *Database) persistLocked(values map[string][]byte, revision uint64) erro
 		return err
 	}
 	temporary := d.path + ".tmp"
-	if err := os.WriteFile(temporary, raw, 0o600); err != nil {
+	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(temporary, d.path)
+	if _, err := file.Write(raw); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, d.path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(d.path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func clone(in map[string][]byte) map[string][]byte {

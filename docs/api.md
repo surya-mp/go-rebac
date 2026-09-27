@@ -1,8 +1,10 @@
 # API guide
 
 `go-rebac` keeps the authorization model in the application and tuple storage
-behind `StorageEngine`. Use this page as a map; exported Go comments remain the
-authoritative API reference on pkg.go.dev.
+behind `StorageEngine`. Use this page as an API map. Behavioral preconditions,
+outcomes, and failure contracts are normative only in
+[`SPEC.md` S6](../SPEC.md#s6-public-api-contracts); exported Go comments add
+Go-level usage detail.
 
 ## Build an engine
 
@@ -15,7 +17,8 @@ For a persisted, tenant-scoped model, use
 the selected version and returns an Engine bound to that tenant. Production
 deployments use `NewProductionEngine` or
 `NewProductionEngineFromModelStorage`, which require revisioned atomic storage
-and indexed lookup candidates.
+with at-least-fresh snapshots, snapshot-matched lookup indexes, and resumable
+tenant/global change streams.
 
 `NewConsistentEngineFromModelStorage` adds Zanzibar-style consistency without
 choosing a database. It requires `ConsistentStorage` and
@@ -46,6 +49,11 @@ Direct subjects use `namespace:objectID`; nested usersets use
 `ModelStorage` is optional durable storage for model documents. `Compile`
 binds non-serializable application caveat evaluators after a document is read.
 The exact syntax and index contracts are in [model.md](model.md).
+
+For config-first administration, `NewNamespaceConfigStore(models, tenant,
+modelID)` projects `ReadConfig`, `ListConfigs`, `ListConfigVersions`, and
+`WriteConfig` over the same immutable model documents. A config write creates a
+new whole-model version; activate it explicitly when ready.
 
 ## Authorize
 
@@ -107,4 +115,5 @@ be deterministic and free of I/O because they run during authorization checks.
 
 `github.com/surya-mp/go-rebac/server` provides optional standard-library HTTP
 handlers over a configured Engine. Its read-only data plane and privileged
-tuple-mutation plane are separate. See [server.md](server.md).
+tuple-mutation plane are separate. `server.NewClient` supplies the matching
+typed standard-library client. See [server.md](server.md).

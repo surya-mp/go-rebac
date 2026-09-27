@@ -41,3 +41,7 @@ func (s *memoryStore) DeleteTuple(_ context.Context, tuple rebac.RelationTuple) 
 func TestRun(t *testing.T) {
 	Run(t, func(testing.TB) rebac.StorageEngine { return &memoryStore{} })
 }
+
+func TestReferenceScenarios(t *testing.T) {
+	RunReferenceScenarios(t, func(testing.TB) rebac.StorageEngine { return &memoryStore{} })
+}

@@ -2,8 +2,10 @@ package kv_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,314 @@ import (
 	"github.com/surya-mp/go-rebac/conformance"
 	"github.com/surya-mp/go-rebac/kv"
 )
+
+type hostBackend struct {
+	database          *kv.Database
+	snapshots, writes int
+}
+
+type flakyBackend struct {
+	*hostBackend
+	conflicts int
+}
+
+func (b *flakyBackend) Transaction(ctx context.Context) (kv.WriteTransaction, error) {
+	tx, err := b.hostBackend.Transaction(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &flakyTransaction{WriteTransaction: tx, backend: b}, nil
+}
+
+type flakyTransaction struct {
+	kv.WriteTransaction
+	backend *flakyBackend
+}
+
+type modelWriteBackend struct {
+	*hostBackend
+	modelWrites, activeWrites int
+}
+
+func (b *modelWriteBackend) Transaction(ctx context.Context) (kv.WriteTransaction, error) {
+	tx, err := b.hostBackend.Transaction(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &modelWriteTransaction{WriteTransaction: tx, backend: b}, nil
+}
+
+type modelWriteTransaction struct {
+	kv.WriteTransaction
+	backend *modelWriteBackend
+}
+
+func (t *modelWriteTransaction) Set(ctx context.Context, key string, value []byte) error {
+	if strings.HasPrefix(key, "go-rebac/model/") {
+		t.backend.modelWrites++
+	}
+	if strings.HasPrefix(key, "go-rebac/model-active/") {
+		t.backend.activeWrites++
+	}
+	return t.WriteTransaction.Set(ctx, key, value)
+}
+
+func (t *flakyTransaction) Commit(ctx context.Context) (uint64, error) {
+	if t.backend.conflicts > 0 {
+		t.backend.conflicts--
+		return 0, kv.ErrTransactionConflict
+	}
+	return t.WriteTransaction.Commit(ctx)
+}
+
+func (b *hostBackend) Snapshot(ctx context.Context) (kv.Reader, error) {
+	b.snapshots++
+	return b.database.NewSnapshot(ctx)
+}
+
+func (b *hostBackend) Transaction(ctx context.Context) (kv.WriteTransaction, error) {
+	b.writes++
+	return b.database.NewTransaction(ctx)
+}
+
+func TestReBACStoreUsesHostBackend(t *testing.T) {
+	backend := &hostBackend{database: kv.New()}
+	store := kv.NewReBACStore(backend)
+	ctx := context.Background()
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	if err := store.WriteTuple(ctx, tuple); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QueryTuples(ctx, tuple); err != nil {
+		t.Fatal(err)
+	}
+	if backend.writes == 0 || backend.snapshots == 0 {
+		t.Fatalf("backend usage = %d writes, %d snapshots; want both", backend.writes, backend.snapshots)
+	}
+}
+
+func TestReBACStoreRetriesTransactionConflict(t *testing.T) {
+	backend := &flakyBackend{hostBackend: &hostBackend{database: kv.New()}, conflicts: 1}
+	store := kv.NewReBACStore(backend)
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	if revision, err := store.WriteTupleWithRevision(context.Background(), tuple); err != nil || revision != "1" {
+		t.Fatalf("WriteTupleWithRevision() = %q, %v; want 1, nil", revision, err)
+	}
+	if backend.writes != 2 {
+		t.Fatalf("transactions = %d; want retry", backend.writes)
+	}
+}
+
+func TestReBACStoreConfiguresConflictRetriesAndKeyPrefix(t *testing.T) {
+	backend := &flakyBackend{hostBackend: &hostBackend{database: kv.New()}, conflicts: 1}
+	store := kv.NewReBACStoreWithOptions(backend, kv.ReBACStoreOptions{KeyPrefix: "application/authz", TransactionRetries: 1})
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	if _, err := store.WriteTupleWithRevision(context.Background(), tuple); err != nil {
+		t.Fatal(err)
+	}
+	if backend.writes != 2 {
+		t.Fatalf("transactions = %d; want one configured retry", backend.writes)
+	}
+	snapshot, err := backend.database.NewSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	keys, err := snapshot.Ascend(context.Background(), "")
+	if err != nil || len(keys) == 0 || !strings.HasPrefix(keys[0], "application/authz/go-rebac/") {
+		t.Fatalf("prefixed keys = %v, %v", keys, err)
+	}
+}
+
+func TestReBACStoreStoresLiveTuplesAsForwardAndReverseRecords(t *testing.T) {
+	database := kv.New()
+	store := kv.NewReBACStore(database)
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	revision, err := store.WriteTupleWithRevision(context.Background(), tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := database.NewSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	raw, ok, err := snapshot.Get(context.Background(), "go-rebac/state")
+	if err != nil || !ok {
+		t.Fatalf("current state = %v, %v, %v", raw, ok, err)
+	}
+	var current struct {
+		TupleLayout int                   `json:"tuple_layout"`
+		Tuples      []rebac.RelationTuple `json:"tuples"`
+	}
+	if err := json.Unmarshal(raw, &current); err != nil || current.TupleLayout != 1 || len(current.Tuples) != 0 {
+		t.Fatalf("current state = %#v, %v; want tuple layout without embedded tuples", current, err)
+	}
+	if keys, err := snapshot.Ascend(context.Background(), "go-rebac/tuple/"); err != nil || len(keys) != 1 {
+		t.Fatalf("forward tuple keys = %v, %v; want one", keys, err)
+	}
+	if keys, err := snapshot.Ascend(context.Background(), "go-rebac/subject/"); err != nil || len(keys) != 1 {
+		t.Fatalf("reverse tuple keys = %v, %v; want one", keys, err)
+	}
+	if keys, err := snapshot.Ascend(context.Background(), "go-rebac/resource/"); err != nil || len(keys) != 1 {
+		t.Fatalf("resource candidate keys = %v, %v; want one", keys, err)
+	}
+	if candidates, err := store.LookupResourceCandidates(context.Background(), rebac.LookupResourcesRequest{TenantID: "acme", Namespace: "document"}); err != nil || len(candidates) != 1 || candidates[0] != "plan" {
+		t.Fatalf("record-backed resource candidates = %v, %v; want [plan], nil", candidates, err)
+	}
+	if candidates, err := store.LookupSubjectCandidates(context.Background(), rebac.LookupSubjectsRequest{TenantID: "acme"}); err != nil || len(candidates) != 1 || candidates[0] != "user:alice" {
+		t.Fatalf("record-backed subject candidates = %v, %v; want [user:alice], nil", candidates, err)
+	}
+	if _, ok, err := snapshot.Get(context.Background(), "go-rebac/state/"+string(revision)); err != nil || ok {
+		t.Fatalf("whole-state history = exists:%v, err:%v; want absent", ok, err)
+	}
+	if _, ok, err := snapshot.Get(context.Background(), "go-rebac/revision/"+string(revision)); err != nil || !ok {
+		t.Fatalf("revision marker = exists:%v, err:%v; want present", ok, err)
+	}
+	if keys, err := snapshot.Ascend(context.Background(), "go-rebac/tuple-history/"); err != nil || len(keys) != 1 {
+		t.Fatalf("tuple history keys = %v, %v; want one", keys, err)
+	}
+}
+
+func TestReBACStoreRebuildsSnapshotsFromRecordHistory(t *testing.T) {
+	store := kv.NewReBACStore(kv.New())
+	ctx := context.Background()
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	created, err := store.WriteTupleWithRevision(ctx, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.DeleteTupleWithRevision(ctx, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _, closeBefore, err := store.SnapshotAt(ctx, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBefore()
+	if tuples, err := before.QueryTuples(ctx, tuple); err != nil || len(tuples) != 1 {
+		t.Fatalf("snapshot before delete = %v, %v; want tuple", tuples, err)
+	}
+	after, _, closeAfter, err := store.SnapshotAt(ctx, removed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAfter()
+	if tuples, err := after.QueryTuples(ctx, tuple); err != nil || len(tuples) != 0 {
+		t.Fatalf("snapshot after delete = %v, %v; want none", tuples, err)
+	}
+}
+
+func TestReBACStoreCompactsExpiredHistoryAtRecordCheckpoint(t *testing.T) {
+	store := kv.NewReBACStoreWithOptions(kv.New(), kv.ReBACStoreOptions{HistoryRevisions: 2})
+	ctx := context.Background()
+	first, err := store.WriteTupleWithRevision(ctx, rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "one", Relation: "viewer", User: "user:alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.WriteTupleWithRevision(ctx, rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "two", Relation: "viewer", User: "user:alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.WriteTupleWithRevision(ctx, rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "three", Relation: "viewer", User: "user:alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.SnapshotAt(ctx, first); !errors.Is(err, rebac.ErrInvalidRevision) {
+		t.Fatalf("expired SnapshotAt() error = %v; want ErrInvalidRevision", err)
+	}
+	reader, _, release, err := store.SnapshotAt(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if tuples, err := reader.QueryTuples(ctx, rebac.RelationTuple{TenantID: "acme", Namespace: "document"}); err != nil || len(tuples) != 2 {
+		t.Fatalf("retained snapshot = %v, %v; want two tuples", tuples, err)
+	}
+}
+
+func TestReBACStoreCleansEmptyCandidateMarker(t *testing.T) {
+	database := kv.New()
+	store := kv.NewReBACStore(database)
+	ctx := context.Background()
+	tuple := rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}
+	if _, err := store.WriteTupleWithRevision(ctx, tuple); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.DeleteTupleWithRevision(ctx, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidates, err := store.LookupResourceCandidates(ctx, rebac.LookupResourcesRequest{TenantID: "acme", Namespace: "document"}); err != nil || len(candidates) != 0 {
+		t.Fatalf("candidates after delete = %v, %v; want none", candidates, err)
+	}
+	if indexedAt, err := store.CandidateIndexRevision(ctx); err != nil || indexedAt != revision {
+		t.Fatalf("CandidateIndexRevision() = %q, %v; want %q, nil", indexedAt, err, revision)
+	}
+}
+
+func TestReBACStoreStoresModelVersionsAndActivePointerAsRecords(t *testing.T) {
+	database := kv.New()
+	store := kv.NewReBACStore(database)
+	ctx := context.Background()
+	document := rebac.ModelDocument{ID: "access", Model: rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}}}
+	stored, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", document, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ActivateAuthorizationModel(ctx, "acme", "access", "", stored.Version); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := database.NewSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	raw, ok, err := snapshot.Get(ctx, "go-rebac/state")
+	if err != nil || !ok {
+		t.Fatalf("current state = %v, %v, %v", raw, ok, err)
+	}
+	var current struct {
+		ModelLayout  int                              `json:"model_layout"`
+		Models       map[string][]rebac.ModelDocument `json:"models"`
+		ActiveModels map[string]rebac.Revision        `json:"active_models"`
+	}
+	if err := json.Unmarshal(raw, &current); err != nil || current.ModelLayout != 1 || len(current.Models) != 0 || len(current.ActiveModels) != 0 {
+		t.Fatalf("current state = %#v, %v; want model layout without embedded records", current, err)
+	}
+	if keys, err := snapshot.Ascend(ctx, "go-rebac/model/"); err != nil || len(keys) != 1 {
+		t.Fatalf("model version keys = %v, %v; want one", keys, err)
+	}
+	if keys, err := snapshot.Ascend(ctx, "go-rebac/model-active/"); err != nil || len(keys) != 1 {
+		t.Fatalf("active model keys = %v, %v; want one", keys, err)
+	}
+}
+
+func TestReBACStoreWritesOnlyChangedModelRecords(t *testing.T) {
+	backend := &modelWriteBackend{hostBackend: &hostBackend{database: kv.New()}}
+	store := kv.NewReBACStore(backend)
+	ctx := context.Background()
+	document := rebac.ModelDocument{ID: "access", Model: rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}}}
+	stored, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", document, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.modelWrites != 1 || backend.activeWrites != 0 {
+		t.Fatalf("initial model writes = %d/%d; want 1/0", backend.modelWrites, backend.activeWrites)
+	}
+	if _, err := store.WriteTupleWithRevision(ctx, rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if backend.modelWrites != 1 || backend.activeWrites != 0 {
+		t.Fatalf("tuple mutation rewrote models = %d/%d; want 1/0", backend.modelWrites, backend.activeWrites)
+	}
+	if _, _, err := store.ActivateAuthorizationModel(ctx, "acme", stored.ID, "", stored.Version); err != nil {
+		t.Fatal(err)
+	}
+	if backend.modelWrites != 1 || backend.activeWrites != 1 {
+		t.Fatalf("activation writes = %d/%d; want 1/1", backend.modelWrites, backend.activeWrites)
+	}
+}
 
 func TestReBACStore(t *testing.T) {
 	conformance.Run(t, func(testing.TB) rebac.StorageEngine {
@@ -26,6 +336,9 @@ func TestReBACStoreConsistent(t *testing.T) {
 }
 
 func TestReBACStoreCapabilities(t *testing.T) {
+	conformance.RunProduction(t, func(testing.TB) rebac.ProductionStorage {
+		return kv.NewReBACStore(kv.New())
+	})
 	conformance.RunRevisioned(t, func(testing.TB) (rebac.StorageEngine, rebac.RevisionedStorage) {
 		store := kv.NewReBACStore(kv.New())
 		return store, store
@@ -90,6 +403,33 @@ func TestReBACStoreWatchResumesAndFilters(t *testing.T) {
 	}
 	if event := nextEvent(t, events, errs); event.TenantID != "acme" || event.Changes[0].Tuple.ObjectID != "third" {
 		t.Fatalf("live event = %+v; want acme document:third", event)
+	}
+}
+
+func TestReBACStoreGlobalWatchUsesOneEventPerCommitAndSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rebac.json")
+	database, err := kv.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := kv.NewReBACStore(database)
+	ctx := context.Background()
+	if _, err := store.Mutate(ctx, []rebac.TupleChange{
+		{Operation: rebac.WriteOperation, Tuple: rebac.RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "one", Relation: "viewer", User: "user:alice"}},
+		{Operation: rebac.WriteOperation, Tuple: rebac.RelationTuple{TenantID: "other", Namespace: "document", ObjectID: "two", Relation: "viewer", User: "user:bob"}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := kv.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	events, errs := kv.NewReBACStore(reopened).WatchAllTuples(watchCtx, rebac.GlobalWatchRequest{After: "0"})
+	event := nextEvent(t, events, errs)
+	if event.TenantID != "" || len(event.Changes) != 2 || event.Revision == "" {
+		t.Fatalf("global event = %+v; want one two-tenant committed event", event)
 	}
 }
 
@@ -243,6 +583,23 @@ func TestAuthorizationModelActivationAndRollback(t *testing.T) {
 	}
 	if active, err = store.ReadActiveAuthorizationModel(ctx, "acme", model.ID); err != nil || active.Version != first.Version {
 		t.Fatalf("rolled back model = %#v, %v; want first version", active, err)
+	}
+}
+
+func TestAuthorizationModelActivationRetriesConflict(t *testing.T) {
+	backend := &flakyBackend{hostBackend: &hostBackend{database: kv.New()}}
+	store := kv.NewReBACStore(backend)
+	ctx := context.Background()
+	model := rebac.ModelDocument{ID: "access", Model: rebac.AuthorizationModel{Namespaces: map[string]rebac.NamespaceDefinition{"user": {}}}}
+	stored, _, err := store.WriteAuthorizationModelWithRevision(ctx, "acme", model, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := backend.writes
+	backend.conflicts = 1
+	active, _, err := store.ActivateAuthorizationModel(ctx, "acme", model.ID, "", stored.Version)
+	if err != nil || active.Version != stored.Version || backend.writes != before+2 {
+		t.Fatalf("ActivateAuthorizationModel() = %#v, %v; transactions=%d, want retry", active, err, backend.writes)
 	}
 }
 

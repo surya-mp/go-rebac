@@ -14,6 +14,10 @@ adminMux.Handle("/authz-admin/", http.StripPrefix("/authz-admin", api.AdminHandl
 Mount `AdminHandler` behind stricter application authorization than `Handler`.
 Anyone able to write tuples can change permissions.
 
+Use `api.WithModelStorage(models)` for model administration endpoints. The
+matching typed client is constructed with `server.NewClient(baseURL, client)`;
+the host configures authentication on that HTTP client's transport.
+
 ## Data-plane routes
 
 | Route | Request | Response |
@@ -30,6 +34,10 @@ Anyone able to write tuples can change permissions.
 Tuple mutation endpoints are exposed only by `AdminHandler`:
 `/v1/tuples/write`, `/v1/tuples/delete`, `/v1/tuples/mutate`, and
 `/v1/objects/delete`.
+
+With model storage configured, `Handler` serves `/v1/models/read`,
+`/v1/models/versions`, and `/v1/models/active`; `AdminHandler` serves
+`/v1/models/write` and `/v1/models/activate`.
 
 ## Consistent endpoint example
 

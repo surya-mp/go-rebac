@@ -10,7 +10,8 @@ transport, and any external-database integration.
 | --- | --- |
 | Add ReBAC checks to one Go application | [Five-minute quickstart](getting-started.md) |
 | Design namespaces, relations, and rewrites | [Modeling guide](modeling.md) |
-| Learn the evaluator's normative behavior | [Authorization semantics](semantics.md) |
+| Read the normative behavioral contract | [Specification](../SPEC.md) |
+| Learn the evaluator's conceptual model | [Authorization semantics guide](semantics.md) |
 | Understand component ownership | [Architecture](architecture.md) |
 | Review API compatibility rules | [API stability](api-stability.md) |
 | Implement a database store | [Storage guide](storage.md) |

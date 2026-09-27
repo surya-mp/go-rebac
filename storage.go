@@ -74,6 +74,13 @@ type SnapshotSubjectCandidateReader interface {
 	LookupSubjectCandidatesAt(ctx context.Context, snapshot Revision, request LookupSubjectsRequest) (candidates []string, indexedAt Revision, err error)
 }
 
+// CandidateIndexWatermark reports the newest revision at which the adapter's
+// current candidate indexes are complete. It is diagnostic; strict lookups
+// still require the snapshot-specific candidate interfaces above.
+type CandidateIndexWatermark interface {
+	CandidateIndexRevision(ctx context.Context) (Revision, error)
+}
+
 // SnapshotStorage provides a consistent read view for an entire Check call.
 // The caller must invoke the returned release function exactly once.
 type SnapshotStorage interface {
@@ -156,9 +163,29 @@ type ResumableWatchStorage interface {
 	WatchTuples(ctx context.Context, request WatchRequest) (<-chan WatchEvent, <-chan error)
 }
 
-// ProductionStorage is the minimum contract for an adapter used by
-// NewProductionEngine. It guarantees revision-pinned reads, atomic writes,
-// and storage-backed candidates for both lookup directions.
+// GlobalWatchRequest resumes the datastore-wide tuple changelog. Events are
+// ordered by revision and contain every tenant's changes from one commit. An
+// empty Tenants filter includes all tenants; Namespaces filters individual
+// changes without changing the revision sequence.
+type GlobalWatchRequest struct {
+	After      Revision `json:"after,omitempty"`
+	Tenants    []string `json:"tenants,omitempty"`
+	Namespaces []string `json:"namespaces,omitempty"`
+}
+
+// GlobalWatchStorage exposes a durable, resumable changelog across tenants.
+// A returned event has an empty TenantID and all changes from its commit;
+// consumers must checkpoint only after processing the complete event.
+type GlobalWatchStorage interface {
+	WatchAllTuples(ctx context.Context, request GlobalWatchRequest) (<-chan WatchEvent, <-chan error)
+}
+
+// ProductionStorage is the contract for an adapter used by
+// NewProductionEngine. It requires atomic mutations, exact and at-least-fresh
+// snapshots from one ordered revision sequence, snapshot-matched candidate
+// indexes, and durable resumable tuple/global changelogs. Interface membership
+// cannot prove a backend's durability or external consistency; adapters MUST
+// demonstrate those properties with their database-specific fault tests.
 //
 // StorageEngine remains intentionally smaller for tests, prototypes, and
 // applications that only need Check and tuple writes.
@@ -166,18 +193,19 @@ type ProductionStorage interface {
 	StorageEngine
 	RevisionedStorage
 	MutationStorage
+	AtLeastFreshStorage
 	ResourceCandidateReader
 	SubjectCandidateReader
-}
-
-// ConsistentStorage is the stronger optional contract required by
-// NewConsistentEngineFromModelStorage. It makes at-least-as-fresh snapshots
-// and revision-matched lookup indexes mandatory; StorageEngine stays small so
-// ordinary applications remain database agnostic.
-type ConsistentStorage interface {
-	ProductionStorage
-	AtLeastFreshStorage
 	SnapshotResourceCandidateReader
 	SnapshotSubjectCandidateReader
+	WatchStorage
 	ResumableWatchStorage
+	GlobalWatchStorage
+}
+
+// ConsistentStorage is ProductionStorage used with RevisionedModelStorage.
+// The model store and tuple store MUST share the same externally consistent
+// revision sequence.
+type ConsistentStorage interface {
+	ProductionStorage
 }

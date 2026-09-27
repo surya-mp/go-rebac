@@ -16,6 +16,7 @@ import (
 // Server adapts one configured Engine to data-plane and administration handlers.
 type Server struct {
 	engine       *rebac.Engine
+	models       rebac.ModelStorage
 	codec        rebac.TokenCodec
 	maxBodyBytes int64
 	maxBatchSize int
@@ -53,6 +54,14 @@ func NewWithTokenCodec(engine *rebac.Engine, codec rebac.TokenCodec) (*Server, e
 	return &Server{engine: engine, codec: codec, maxBodyBytes: defaultMaxBodyBytes, maxBatchSize: defaultMaxBatchSize, timeout: defaultTimeout}, nil
 }
 
+// WithModelStorage returns a copy exposing model administration endpoints.
+// Mount AdminHandler behind separate, stricter application authorization.
+func (s *Server) WithModelStorage(models rebac.ModelStorage) *Server {
+	configured := *s
+	configured.models = models
+	return &configured
+}
+
 // WithRequestLimits returns a copy with explicit HTTP request ceilings.
 func (s *Server) WithRequestLimits(limits RequestLimits) *Server {
 	configured := *s
@@ -82,6 +91,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/lookup/resources", s.lookupResources)
 	mux.HandleFunc("POST /v1/lookup/subjects", s.lookupSubjects)
 	mux.HandleFunc("POST /v1/expand", s.expand)
+	mux.HandleFunc("POST /v1/models/read", s.readModel)
+	mux.HandleFunc("POST /v1/models/versions", s.listModelVersions)
+	mux.HandleFunc("POST /v1/models/active", s.readActiveModel)
 	return s.withTimeout(mux)
 }
 
@@ -94,6 +106,8 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("POST /v1/tuples/delete", s.deleteTuple)
 	mux.HandleFunc("POST /v1/tuples/mutate", s.mutate)
 	mux.HandleFunc("POST /v1/objects/delete", s.deleteObject)
+	mux.HandleFunc("POST /v1/models/write", s.writeModel)
+	mux.HandleFunc("POST /v1/models/activate", s.activateModel)
 	return s.withTimeout(mux)
 }
 
@@ -169,7 +183,8 @@ type revisionResponse struct {
 	Revision rebac.Revision `json:"revision,omitempty"`
 }
 
-type expandRequest struct {
+// ExpandRequest identifies a relationship expression to expand.
+type ExpandRequest struct {
 	TenantID  string         `json:"tenant_id"`
 	Revision  rebac.Revision `json:"revision,omitempty"`
 	Relation  string         `json:"relation"`
@@ -177,10 +192,43 @@ type expandRequest struct {
 	ObjectID  string         `json:"object_id"`
 }
 
-type expandResponse struct {
+// ExpandResponse is the canonical expansion tree and revision used.
+type ExpandResponse struct {
 	Expansion rebac.Expansion `json:"expansion"`
 	Revision  rebac.Revision  `json:"revision,omitempty"`
 }
+
+// ReadModelRequest identifies one authorization model version. An empty
+// Version selects the latest stored version.
+type ReadModelRequest struct {
+	TenantID string         `json:"tenant_id"`
+	ModelID  string         `json:"model_id"`
+	Version  rebac.Revision `json:"version,omitempty"`
+}
+
+// WriteModelRequest creates an immutable model version using optimistic CAS.
+type WriteModelRequest struct {
+	TenantID string              `json:"tenant_id"`
+	Document rebac.ModelDocument `json:"document"`
+	Expected rebac.Revision      `json:"expected,omitempty"`
+}
+
+// ActivateModelRequest atomically moves the active model pointer.
+type ActivateModelRequest struct {
+	TenantID       string         `json:"tenant_id"`
+	ModelID        string         `json:"model_id"`
+	ExpectedActive rebac.Revision `json:"expected_active,omitempty"`
+	Version        rebac.Revision `json:"version"`
+}
+
+// ActivateModelResponse contains the selected document and its global
+// authorization revision.
+type ActivateModelResponse struct {
+	Document rebac.ModelDocument `json:"document"`
+	Revision rebac.Revision      `json:"revision"`
+}
+
+var errModelStorageNotConfigured = errors.New("rebac/server: model storage is not configured")
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -325,7 +373,7 @@ func (s *Server) lookupSubjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
-	var request expandRequest
+	var request ExpandRequest
 	if !s.decodeJSON(w, r, &request) {
 		return
 	}
@@ -334,7 +382,75 @@ func (s *Server) expand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, expandResponse{Expansion: expansion, Revision: revision})
+	writeJSON(w, http.StatusOK, ExpandResponse{Expansion: expansion, Revision: revision})
+}
+
+func (s *Server) modelStorage() (rebac.ModelStorage, error) {
+	if s.models == nil {
+		return nil, errModelStorageNotConfigured
+	}
+	return s.models, nil
+}
+
+func (s *Server) readModel(w http.ResponseWriter, r *http.Request) {
+	var request ReadModelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	models, err := s.modelStorage()
+	if err == nil {
+		var document rebac.ModelDocument
+		document, err = models.ReadAuthorizationModel(r.Context(), request.TenantID, request.ModelID, request.Version)
+		if err == nil {
+			writeJSON(w, http.StatusOK, document)
+			return
+		}
+	}
+	writeError(w, err)
+}
+
+func (s *Server) listModelVersions(w http.ResponseWriter, r *http.Request) {
+	var request ReadModelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	models, err := s.modelStorage()
+	if err == nil {
+		lister, ok := models.(rebac.ModelVersionLister)
+		if !ok {
+			err = errModelStorageNotConfigured
+		} else {
+			var documents []rebac.ModelDocument
+			documents, err = lister.ListAuthorizationModelVersions(r.Context(), request.TenantID, request.ModelID)
+			if err == nil {
+				writeJSON(w, http.StatusOK, documents)
+				return
+			}
+		}
+	}
+	writeError(w, err)
+}
+
+func (s *Server) readActiveModel(w http.ResponseWriter, r *http.Request) {
+	var request ReadModelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	models, err := s.modelStorage()
+	if err == nil {
+		active, ok := models.(rebac.ActiveModelStorage)
+		if !ok {
+			err = errModelStorageNotConfigured
+		} else {
+			var document rebac.ModelDocument
+			document, err = active.ReadActiveAuthorizationModel(r.Context(), request.TenantID, request.ModelID)
+			if err == nil {
+				writeJSON(w, http.StatusOK, document)
+				return
+			}
+		}
+	}
+	writeError(w, err)
 }
 
 func (s *Server) writeTuple(w http.ResponseWriter, r *http.Request) {
@@ -389,6 +505,46 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, revisionResponse{Revision: revision})
 }
 
+func (s *Server) writeModel(w http.ResponseWriter, r *http.Request) {
+	var request WriteModelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	models, err := s.modelStorage()
+	if err == nil {
+		var document rebac.ModelDocument
+		document, err = models.WriteAuthorizationModel(r.Context(), request.TenantID, request.Document, request.Expected)
+		if err == nil {
+			writeJSON(w, http.StatusOK, document)
+			return
+		}
+	}
+	writeError(w, err)
+}
+
+func (s *Server) activateModel(w http.ResponseWriter, r *http.Request) {
+	var request ActivateModelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	models, err := s.modelStorage()
+	if err == nil {
+		active, ok := models.(rebac.ActiveModelStorage)
+		if !ok {
+			err = errModelStorageNotConfigured
+		} else {
+			var document rebac.ModelDocument
+			var revision rebac.Revision
+			document, revision, err = active.ActivateAuthorizationModel(r.Context(), request.TenantID, request.ModelID, request.ExpectedActive, request.Version)
+			if err == nil {
+				writeJSON(w, http.StatusOK, ActivateModelResponse{Document: document, Revision: revision})
+				return
+			}
+		}
+	}
+	writeError(w, err)
+}
+
 func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	limit := s.maxBodyBytes
 	if limit <= 0 {
@@ -422,6 +578,8 @@ func writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, rebac.ErrPreconditionFailed), errors.Is(err, rebac.ErrInvalidRevision):
 		status = http.StatusConflict
 	case errors.Is(err, rebac.ErrConsistencyUnsupported):
+		status = http.StatusNotImplemented
+	case errors.Is(err, errModelStorageNotConfigured):
 		status = http.StatusNotImplemented
 	case errors.Is(err, rebac.ErrStorage):
 		status = http.StatusServiceUnavailable

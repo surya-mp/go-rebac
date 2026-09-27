@@ -112,7 +112,7 @@ returns it, so an index can narrow work but never makes an authorization
 decision. Candidate readers receive the requested, revision-pinned view.
 Stores without these indexes use the portable scan fallback.
 
-`NewProductionEngine` requires `ProductionStorage`: revision-pinned snapshots,
-atomic mutations, and both candidate-reader interfaces. This keeps lightweight
-stores useful for tests while making the stronger contract explicit for a
-production deployment.
+`NewProductionEngine` requires `ProductionStorage`: atomic mutation,
+revision-pinned and at-least-fresh snapshots, revision-matched candidate
+indexes, and resumable tenant/global changelogs. This keeps lightweight stores
+useful for tests while making the stronger contract explicit for production.

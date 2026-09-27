@@ -51,6 +51,17 @@ type fixedStore struct {
 	err    error
 }
 
+type fixedDispatcher struct {
+	request CheckDispatchRequest
+	result  CheckDispatchResult
+	err     error
+}
+
+func (d *fixedDispatcher) DispatchCheck(_ context.Context, request CheckDispatchRequest) (CheckDispatchResult, error) {
+	d.request = request
+	return d.result, d.err
+}
+
 func (s fixedStore) QueryTuples(_ context.Context, _ RelationTuple) ([]RelationTuple, error) {
 	return s.tuples, s.err
 }
@@ -103,6 +114,22 @@ func TestCheckDirectNestedAndCycle(t *testing.T) {
 		if !errors.Is(err, test.wantErr) || got != test.want {
 			t.Fatalf("Check(%q) = %v, %v; want %v, %v", test.objectID, got, err, test.want, test.wantErr)
 		}
+	}
+}
+
+func TestCheckDispatchUsesExactRequestedRevision(t *testing.T) {
+	dispatcher := &fixedDispatcher{result: CheckDispatchResult{Allowed: true, Revision: "7"}}
+	engine, err := NewEngine(&memoryStore{}, testModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, revision, err := engine.WithCheckDispatcher(dispatcher).CheckWithRevision(context.Background(), "7", "acme", "user:alice", "viewer", "document", "plan")
+	if err != nil || !allowed || revision != "7" || dispatcher.request.ObjectID != "plan" || dispatcher.request.Revision != "7" {
+		t.Fatalf("dispatched check = %v, %q, %v; request = %#v", allowed, revision, err, dispatcher.request)
+	}
+	dispatcher.result.Revision = "8"
+	if allowed, _, err := engine.WithCheckDispatcher(dispatcher).CheckWithRevision(context.Background(), "7", "acme", "user:alice", "viewer", "document", "plan"); allowed || !errors.Is(err, ErrDispatch) {
+		t.Fatalf("mismatched dispatch revision = %v, %v; want false, ErrDispatch", allowed, err)
 	}
 }
 
@@ -386,8 +413,8 @@ func TestCheckAtValidityIntervalAndWildcard(t *testing.T) {
 		}
 	}
 	expansion, _, err := engine.ExpandAt(ctx, "", 100, "acme", "viewer", "document", "window")
-	if err != nil || len(expansion.Tuples) != 1 {
-		t.Fatalf("ExpandAt() = %#v, %v; want one active tuple, nil", expansion, err)
+	if err != nil || expansion.Kind != ExpansionRelation || len(expansion.Children) != 1 || expansion.Children[0].Kind != ExpansionThis || len(expansion.Children[0].Tuples) != 1 {
+		t.Fatalf("ExpandAt() = %#v, %v; want one active this tuple, nil", expansion, err)
 	}
 	if err := engine.WriteTuple(ctx, RelationTuple{TenantID: "acme", Namespace: "document", ObjectID: "public", Relation: "viewer", User: "user:*"}); err != nil {
 		t.Fatal(err)
@@ -642,8 +669,64 @@ func TestReadLookupAndExpand(t *testing.T) {
 		t.Fatalf("LookupSubjects() = %#v, %v", subjects, err)
 	}
 	expansion, revision, err := engine.Expand(context.Background(), "42", "acme", "viewer", "document", "b")
-	if err != nil || revision != "42" || expansion.Revision != "42" || len(expansion.Tuples) != 2 || len(expansion.Children) != 1 || expansion.Children[0].Revision != "42" {
+	if err != nil || revision != "42" || expansion.Kind != ExpansionRelation || expansion.Revision != "42" || len(expansion.Children) != 1 || expansion.Children[0].Kind != ExpansionThis || len(expansion.Children[0].Tuples) != 2 || len(expansion.Children[0].Children) != 1 || expansion.Children[0].Children[0].Revision != "42" {
 		t.Fatalf("Expand() = %#v, %q, %v", expansion, revision, err)
+	}
+}
+
+func TestExpandBuildsCanonicalRewriteTree(t *testing.T) {
+	model := AuthorizationModel{Namespaces: map[string]NamespaceDefinition{
+		"user": {},
+		"group": {Relations: map[string]RelationDefinition{
+			"member": {AllowedSubjects: []SubjectReference{{Namespace: "user"}}},
+		}},
+		"folder": {Relations: map[string]RelationDefinition{
+			"viewer": {AllowedSubjects: []SubjectReference{{Namespace: "user"}}},
+		}},
+		"document": {Relations: map[string]RelationDefinition{
+			"owner":   {AllowedSubjects: []SubjectReference{{Namespace: "user"}}},
+			"parent":  {AllowedSubjects: []SubjectReference{{Namespace: "folder"}}},
+			"blocked": {AllowedSubjects: []SubjectReference{{Namespace: "user"}}},
+			"viewer": {AllowedSubjects: []SubjectReference{{Namespace: "user"}}, Rewrite: Rewrite{Exclusion: &Exclusion{
+				Base:     Rewrite{Intersection: []Rewrite{{Union: []Rewrite{{ComputedUserset: "owner"}, {TupleToUserset: &TupleToUserset{Tupleset: "parent", ComputedUserset: "viewer"}}}}, {This: true}}},
+				Subtract: Rewrite{ComputedUserset: "blocked"},
+			}}},
+		}},
+	}}
+	store := memoryStore{
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "owner", User: "user:alice"},
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "parent", User: "folder:root"},
+		{TenantID: "acme", Namespace: "folder", ObjectID: "root", Relation: "viewer", User: "user:bob"},
+		{TenantID: "acme", Namespace: "document", ObjectID: "plan", Relation: "viewer", User: "user:carol"},
+	}
+	engine, err := NewEngine(&store, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expansion, _, err := engine.Expand(context.Background(), "", "acme", "viewer", "document", "plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expansion.Kind != ExpansionRelation || len(expansion.Children) != 1 {
+		t.Fatalf("root = %#v; want relation with one rewrite", expansion)
+	}
+	exclusion := expansion.Children[0]
+	if exclusion.Kind != ExpansionExclusion || len(exclusion.Children) != 2 {
+		t.Fatalf("exclusion = %#v; want ordered base and subtract branches", exclusion)
+	}
+	intersection := exclusion.Children[0]
+	if intersection.Kind != ExpansionIntersection || len(intersection.Children) != 2 {
+		t.Fatalf("intersection = %#v; want two operands", intersection)
+	}
+	union := intersection.Children[0]
+	if union.Kind != ExpansionUnion || len(union.Children) != 2 || union.Children[0].Kind != ExpansionComputedUserset || union.Children[1].Kind != ExpansionTupleToUserset {
+		t.Fatalf("union = %#v; want computed and tuple-to-userset operands", union)
+	}
+	if got := union.Children[1]; len(got.Tuples) != 1 || len(got.Children) != 1 || got.Children[0].Namespace != "folder" || got.Children[0].Relation != "viewer" {
+		t.Fatalf("tuple-to-userset = %#v; want parent tuple and folder viewer relation", got)
+	}
+	if got := intersection.Children[1]; got.Kind != ExpansionThis || len(got.Tuples) != 1 || got.Tuples[0].User != "user:carol" {
+		t.Fatalf("this = %#v; want direct viewer tuple", got)
 	}
 }
 
@@ -832,6 +915,14 @@ func (s *indexedMemoryStore) LookupSubjectCandidatesAt(ctx context.Context, snap
 
 func (s *indexedMemoryStore) WatchTuples(ctx context.Context, request WatchRequest) (<-chan WatchEvent, <-chan error) {
 	return s.Watch(ctx, request.TenantID, request.After)
+}
+
+func (s *indexedMemoryStore) WatchAllTuples(_ context.Context, _ GlobalWatchRequest) (<-chan WatchEvent, <-chan error) {
+	events := make(chan WatchEvent)
+	errs := make(chan error)
+	close(events)
+	close(errs)
+	return events, errs
 }
 
 func (s *indexedMemoryStore) LookupResourceCandidates(_ context.Context, _ LookupResourcesRequest) ([]string, error) {

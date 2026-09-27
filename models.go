@@ -16,24 +16,52 @@ type compiledModelKey struct {
 }
 
 type compiledModelCache struct {
-	mu     sync.RWMutex
+	mu     sync.Mutex
+	max    int
 	models map[compiledModelKey]*CompiledModel
+	order  []compiledModelKey
+}
+
+const defaultCompiledModelCacheSize = 128
+
+func newCompiledModelCache(max int) *compiledModelCache {
+	return &compiledModelCache{max: max, models: make(map[compiledModelKey]*CompiledModel)}
 }
 
 func (c *compiledModelCache) get(key compiledModelKey) *CompiledModel {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.models[key]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	model := c.models[key]
+	if model != nil {
+		c.touch(key)
+	}
+	return model
 }
 
 func (c *compiledModelCache) put(key compiledModelKey, model *CompiledModel) *CompiledModel {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if cached := c.models[key]; cached != nil {
+		c.touch(key)
 		return cached
 	}
+	if c.max > 0 && len(c.order) == c.max {
+		delete(c.models, c.order[0])
+		c.order = c.order[1:]
+	}
 	c.models[key] = model
+	c.order = append(c.order, key)
 	return model
+}
+
+func (c *compiledModelCache) touch(key compiledModelKey) {
+	for index, existing := range c.order {
+		if existing == key {
+			copy(c.order[index:], c.order[index+1:])
+			c.order[len(c.order)-1] = key
+			return
+		}
+	}
 }
 
 func (e *Engine) compiledModelForDocument(tenantID string, document ModelDocument) (*CompiledModel, error) {

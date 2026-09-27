@@ -43,6 +43,7 @@ Start with the [documentation index](docs/README.md). It includes guided
 material for [modeling](docs/modeling.md), [storage implementations](docs/storage.md),
 [content consistency](docs/consistency.md), [HTTP integration](docs/http.md),
 and [testing and operations](docs/operations.md).
+The normative behavioral contract is [SPEC.md](SPEC.md).
 Release history is in [CHANGELOG.md](CHANGELOG.md).
 
 The local `rebac` CLI validates models and inspects the bundled KV store:
@@ -124,11 +125,19 @@ if !allowed {
 return nil
 ```
 
-`kv.New()` is an in-process store. For durable local storage, use
+`kv.New()` is an in-process store. `kv.NewReBACStore` also accepts a
+host-supplied `kv.Backend` that provides snapshot reads and atomic
+transactions. For durable local storage, use
 `database, err := kv.Open("rebac.json")` and pass `database` to
 `kv.NewReBACStore`. It is a single-process store; do not share its file across
 processes. A distributed database can implement `StorageEngine` and the
 revisioned contracts when cross-process or cross-region consistency is needed.
+
+`Expand` returns a canonical expression tree: a relation node wraps exactly
+one `this`, computed-userset, tuple-to-userset, union, intersection, or
+exclusion node. `WithCheckDispatcher` can route a top-level exact-snapshot
+check to an application-provided remote worker. `WatchAllTuples` exposes a
+durable, retained cross-tenant tuple changelog when the store implements it.
 
 ## Authorization models
 
@@ -148,9 +157,10 @@ model version. See [docs/model.md](docs/model.md) for the strict portable
 grammar and model-storage contract.
 
 For a production adapter, use `NewProductionEngine` (or
-`NewProductionEngineFromModelStorage`). It requires revision-pinned reads,
-atomic mutations, and both indexed lookup candidate capabilities. Lightweight
-adapters can continue to use `NewEngine` for local tests and prototypes.
+`NewProductionEngineFromModelStorage`). It requires atomic mutation,
+revision-pinned and at-least-fresh snapshots, revision-matched candidate
+indexes, and durable resumable tuple/global watches. Lightweight adapters can
+continue to use `NewEngine` for local tests and prototypes.
 
 For Zanzibar-style content consistency, use
 `NewConsistentEngineFromModelStorage`. Its storage implements

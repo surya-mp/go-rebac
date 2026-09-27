@@ -10,6 +10,22 @@ import (
 	"testing"
 )
 
+func TestCompiledModelCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	cache := newCompiledModelCache(2)
+	first := compiledModelKey{modelID: "first"}
+	second := compiledModelKey{modelID: "second"}
+	third := compiledModelKey{modelID: "third"}
+	cache.put(first, &CompiledModel{})
+	cache.put(second, &CompiledModel{})
+	if cache.get(first) == nil {
+		t.Fatal("first cache entry missing")
+	}
+	cache.put(third, &CompiledModel{})
+	if cache.get(second) != nil || cache.get(first) == nil || cache.get(third) == nil {
+		t.Fatalf("cache contents = %#v; want first and third", cache.models)
+	}
+}
+
 type staticModelStorage struct{ document ModelDocument }
 
 func (s staticModelStorage) ReadAuthorizationModel(_ context.Context, tenantID, modelID string, version Revision) (ModelDocument, error) {
