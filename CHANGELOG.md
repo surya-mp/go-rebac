@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.0
+
+- Raise the supported Go baseline to 1.27.1 because earlier supported Go
+  standard libraries have reachable `net/http`, `crypto/tls`, `net/url`, and
+  filesystem vulnerabilities. CI and release builds use the patched baseline.
+
 ## v0.4.0
 
 - Expand the normative specification with compact decision, snapshot, API, and
