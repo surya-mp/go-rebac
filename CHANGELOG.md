@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Consolidate GitHub Actions validation and tag-release automation into one
+  workflow, while keeping signing and release permissions tag-scoped.
+
 ## v0.5.0
 
 - Raise the supported Go baseline to 1.27.1 because earlier supported Go
